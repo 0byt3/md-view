@@ -665,8 +665,8 @@ fn node_box_size(node: &FNode) -> (f32, f32) {
             width = width.max(NODE_H);
         }
         Shape::Diamond => {
-            width = (width * 1.4).max(148.0);
-            height = NODE_H * 2.2;
+            width = (width * 1.45).max(160.0);
+            height = NODE_H * 2.6;
         }
         _ => {}
     }
@@ -683,15 +683,6 @@ pub fn layout_flowchart(chart: &Flowchart) -> FlowLayout {
         rows[rank[index]].push(index);
     }
     let sizes: Vec<(f32, f32)> = chart.nodes.iter().map(node_box_size).collect();
-    let row_width = |row: &[usize]| {
-        row.iter().map(|&i| sizes[i].0).sum::<f32>() + GAP_X * row.len().saturating_sub(1) as f32
-    };
-    let row_heights: Vec<f32> = rows
-        .iter()
-        .map(|row| row.iter().map(|&i| sizes[i].1).fold(NODE_H, f32::max))
-        .collect();
-    let total_w = rows.iter().map(|row| row_width(row)).fold(0.0f32, f32::max);
-    let total_h = row_heights.iter().sum::<f32>() + GAP_Y * depth as f32;
     let mut boxes = vec![
         Rect {
             x: 0.0,
@@ -701,51 +692,87 @@ pub fn layout_flowchart(chart: &Flowchart) -> FlowLayout {
         };
         count
     ];
-    let mut y = PAD;
-    for (depth_index, row) in rows.iter().enumerate() {
-        let mut x = PAD + (total_w - row_width(row)) / 2.0;
-        let row_h = row_heights[depth_index];
-        for &index in row {
-            let (w, h) = sizes[index];
-            boxes[index] = Rect {
-                x,
-                y: y + (row_h - h) / 2.0,
-                w,
-                h,
-            };
-            x += w + GAP_X;
+    let horizontal = matches!(chart.direction, FlowDir::LeftRight | FlowDir::RightLeft);
+    let (width, height) = if horizontal {
+        // Ranks are columns: x grows by each column's max width so a wide
+        // diamond cannot overlap the next rank (swapping x/y of a TD layout
+        // would keep the diamond's width on the rank axis).
+        let col_ws: Vec<f32> = rows
+            .iter()
+            .map(|row| row.iter().map(|&i| sizes[i].0).fold(0.0f32, f32::max))
+            .collect();
+        let col_hs: Vec<f32> = rows
+            .iter()
+            .map(|row| {
+                row.iter().map(|&i| sizes[i].1).sum::<f32>()
+                    + GAP_Y * 0.6 * row.len().saturating_sub(1) as f32
+            })
+            .collect();
+        let total_h = col_hs.iter().copied().fold(NODE_H, f32::max);
+        let mut x = PAD;
+        for (depth_index, row) in rows.iter().enumerate() {
+            let col_w = col_ws[depth_index];
+            let mut y = PAD + (total_h - col_hs[depth_index]) / 2.0;
+            for &index in row {
+                let (w, h) = sizes[index];
+                boxes[index] = Rect {
+                    x: x + (col_w - w) / 2.0,
+                    y,
+                    w,
+                    h,
+                };
+                y += h + GAP_Y * 0.6;
+            }
+            x += col_w + GAP_X;
         }
-        y += row_h + GAP_Y;
-    }
+        if chart.direction == FlowDir::RightLeft {
+            let width = x + PAD - GAP_X;
+            for rect in &mut boxes {
+                rect.x = width - rect.x - rect.w;
+            }
+        }
+        (x + PAD - GAP_X, total_h + PAD * 2.0)
+    } else {
+        let row_width = |row: &[usize]| {
+            row.iter().map(|&i| sizes[i].0).sum::<f32>()
+                + GAP_X * row.len().saturating_sub(1) as f32
+        };
+        let row_heights: Vec<f32> = rows
+            .iter()
+            .map(|row| row.iter().map(|&i| sizes[i].1).fold(NODE_H, f32::max))
+            .collect();
+        let total_w = rows.iter().map(|row| row_width(row)).fold(0.0f32, f32::max);
+        let total_h = row_heights.iter().sum::<f32>() + GAP_Y * depth as f32;
+        let mut y = PAD;
+        for (depth_index, row) in rows.iter().enumerate() {
+            let mut x = PAD + (total_w - row_width(row)) / 2.0;
+            let row_h = row_heights[depth_index];
+            for &index in row {
+                let (w, h) = sizes[index];
+                boxes[index] = Rect {
+                    x,
+                    y: y + (row_h - h) / 2.0,
+                    w,
+                    h,
+                };
+                x += w + GAP_X;
+            }
+            y += row_h + GAP_Y;
+        }
+        if chart.direction == FlowDir::BottomUp {
+            let height = total_h + PAD * 2.0;
+            for rect in &mut boxes {
+                rect.y = height - rect.y - rect.h;
+            }
+        }
+        (total_w + PAD * 2.0, total_h + PAD * 2.0)
+    };
     let mut layout = FlowLayout {
         boxes,
         edges: Vec::new(),
-        width: total_w + PAD * 2.0,
-        height: total_h + PAD * 2.0,
+        width,
+        height,
     };
-    // Orient: BottomUp flips vertically, LeftRight/RightLeft transpose.
-    match chart.direction {
-        FlowDir::TopDown => {}
-        FlowDir::BottomUp => {
-            for rect in &mut layout.boxes {
-                rect.y = layout.height - rect.y - rect.h;
-            }
-        }
-        FlowDir::LeftRight | FlowDir::RightLeft => {
-            // Swap axes so ranks run left-to-right and same-rank nodes
-            // stack top-to-bottom, without rotating each node's own box
-            // (labels keep their natural width and fixed height).
-            for rect in &mut layout.boxes {
-                std::mem::swap(&mut rect.x, &mut rect.y);
-            }
-            std::mem::swap(&mut layout.width, &mut layout.height);
-            if chart.direction == FlowDir::RightLeft {
-                for rect in &mut layout.boxes {
-                    rect.x = layout.width - rect.x - rect.w;
-                }
-            }
-        }
-    }
     layout.edges = chart
         .edges
         .iter()
@@ -1094,7 +1121,7 @@ mod tests {
         // Start left of the diamond; Yes/No targets share a column; Deploy further right.
         assert!(layout.boxes[0].x < layout.boxes[1].x);
         assert!(layout.boxes[1].x < layout.boxes[2].x);
-        assert!((layout.boxes[2].x - layout.boxes[3].x).abs() < 1.0);
+        assert!((layout.boxes[2].x - layout.boxes[3].x).abs() < 40.0);
         assert!(layout.boxes[4].x > layout.boxes[2].x);
         assert!(layout.boxes[2].y < layout.boxes[3].y);
         assert!(

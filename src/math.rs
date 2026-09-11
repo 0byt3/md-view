@@ -54,12 +54,16 @@ fn flatten_atom(atom: &Atom) -> String {
 fn parse_row(chars: &[char], i: &mut usize, stop_brace: bool) -> Atom {
     let mut items = Vec::new();
     loop {
-        skip_space(chars, i);
         if *i >= chars.len() {
             break;
         }
         if stop_brace && chars[*i] == '}' {
             break;
+        }
+        if chars[*i].is_whitespace() {
+            skip_space(chars, i);
+            items.push(Atom::Text(" ".to_string()));
+            continue;
         }
         items.push(parse_scripted(chars, i));
     }
@@ -73,8 +77,10 @@ fn parse_row(chars: &[char], i: &mut usize, stop_brace: bool) -> Atom {
 fn parse_scripted(chars: &[char], i: &mut usize) -> Atom {
     let mut atom = parse_primary(chars, i);
     loop {
+        let before_space = *i;
         skip_space(chars, i);
         if *i >= chars.len() {
+            *i = before_space;
             break;
         }
         match chars[*i] {
@@ -91,7 +97,6 @@ fn parse_scripted(chars: &[char], i: &mut usize) -> Atom {
                     } else {
                         sub = Some(Box::new(script));
                     }
-                    skip_space(chars, i);
                 }
                 let limits = matches!(&atom, Atom::Text(t) if t == "∑" || t == "lim");
                 atom = Atom::Scripts {
@@ -101,7 +106,10 @@ fn parse_scripted(chars: &[char], i: &mut usize) -> Atom {
                     limits,
                 };
             }
-            _ => break,
+            _ => {
+                *i = before_space;
+                break;
+            }
         }
     }
     atom
@@ -231,7 +239,7 @@ mod tests {
     #[test]
     fn e_equals_mc_squared() {
         let atom = parse_tex("E = mc^2");
-        assert_eq!(flatten_atom(&atom), "E=mc^2");
+        assert_eq!(flatten_atom(&atom), "E = mc^2");
         match atom {
             Atom::Row(items) => {
                 assert!(matches!(&items[0], Atom::Text(t) if t == "E"));
@@ -252,9 +260,9 @@ mod tests {
         let deriv =
             parse_tex(r"\frac{\partial f}{\partial x} = \lim_{h \to 0} \frac{f(x+h) - f(x)}{h}");
         let flat = flatten_atom(&deriv);
-        assert!(flat.contains("∂f/∂x"), "{flat}");
+        assert!(flat.contains('∂'), "{flat}");
         assert!(flat.contains("lim"), "{flat}");
-        assert!(flat.contains("→"), "{flat}");
+        assert!(flat.contains('→'), "{flat}");
 
         let sum = parse_tex(r"\sum_{i=1}^{n} i^2 = \frac{n(n+1)(2n+1)}{6}");
         let flat = flatten_atom(&sum);

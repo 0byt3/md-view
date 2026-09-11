@@ -292,13 +292,20 @@ impl Viewer {
                 .child(node.label.clone());
             // `.id(..)` gives each node a stable identity across re-renders,
             // keyed by its mermaid id rather than its position in the list.
+            let (inset_x, inset_y) = match node.shape {
+                mermaid::Shape::Diamond => (rect.w * 0.22, rect.h * 0.18),
+                mermaid::Shape::Circle | mermaid::Shape::Hexagon | mermaid::Shape::Stadium => {
+                    (8.0, 4.0)
+                }
+                _ => (0.0, 0.0),
+            };
             let placed = div()
                 .id(SharedString::from(format!("node-{}", node.id)))
                 .absolute()
-                .left(px(rect.x))
-                .top(px(rect.y))
-                .w(px(rect.w))
-                .h(px(rect.h));
+                .left(px(rect.x + inset_x))
+                .top(px(rect.y + inset_y))
+                .w(px((rect.w - inset_x * 2.0).max(8.0)))
+                .h(px((rect.h - inset_y * 2.0).max(8.0)));
             let node_el = match node.shape {
                 mermaid::Shape::Round => placed
                     .border_1()
@@ -621,7 +628,7 @@ impl Viewer {
                 .child(text.clone())
                 .into_any_element(),
             math::Atom::Row(items) => {
-                let mut row = div().flex().flex_row().items_center().gap_1();
+                let mut row = div().flex().flex_row().items_end();
                 for item in items {
                     row = row.child(self.render_atom(item, display));
                 }
@@ -663,7 +670,7 @@ impl Viewer {
                     div()
                         .flex()
                         .flex_row()
-                        .items_center()
+                        .items_start()
                         .child(self.render_atom(base, display))
                         .child(scripts)
                         .into_any_element()
