@@ -1,0 +1,10 @@
+{
+  "name": "md-view",
+  "install": "./.cursor/install.sh",
+  "terminals": [
+    {
+      "name": "wayland-headless",
+      "command": "./.cursor/wayland-session.sh"
+    }
+  ]
+}
