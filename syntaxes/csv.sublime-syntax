@@ -1,0 +1,13 @@
+%YAML 1.2
+---
+name: CSV
+scope: text.csv
+file_extensions: [csv]
+contexts:
+  main:
+    - match: '"[^"]*"'
+      scope: string.quoted.double.csv
+    - match: \b-?\d+(?:\.\d+)?\b
+      scope: constant.numeric.csv
+    - match: ','
+      scope: punctuation.separator.csv

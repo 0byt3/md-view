@@ -1,0 +1,21 @@
+%YAML 1.2
+---
+name: INI
+scope: source.ini
+file_extensions: [ini, cfg]
+contexts:
+  main:
+    - match: '[;#].*$'
+      scope: comment.line.ini
+    - match: '^\s*\[.*\]'
+      scope: entity.name.section.ini
+    - match: '"[^"]*"'
+      scope: string.quoted.double.ini
+    - match: (?i)\b(true|false|yes|no|on|off)\b
+      scope: constant.language.ini
+    - match: \b\d+(?:\.\d+)?\b
+      scope: constant.numeric.ini
+    - match: '^[ \t]*[^=;\s\[][^=]*?(?=\s*=)'
+      scope: variable.other.key.ini
+    - match: '='
+      scope: punctuation.separator.key-value.ini
