@@ -25,6 +25,7 @@ pub const TYPE: u32 = 0x2ac3de;
 /// Operators and punctuation (`tokyo_custom` turquoise).
 pub const OPERATOR: u32 = 0x89ddff;
 /// Links and headings accent (`tokyo_custom` blue).
+#[allow(dead_code)]
 pub const BLUE: u32 = 0x7aa2f7;
 /// Visual selection background (`tokyo_custom` `bg_selection`).
 pub const BG_SELECTION: u32 = 0x283457;

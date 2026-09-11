@@ -8,6 +8,7 @@
 
 mod highlight;
 mod markdown;
+mod math;
 mod mermaid;
 mod theme;
 mod vim;
@@ -15,8 +16,8 @@ mod watch;
 
 use gpui::{
     canvas, div, point, prelude::*, px, rgb, size, AnyElement, App, Bounds, ClipboardItem, Context,
-    Font, FontWeight, Keystroke, PathBuilder, ScrollHandle, SharedString, StrikethroughStyle,
-    StyledText, TextRun, UnderlineStyle, Window, WindowBounds, WindowOptions,
+    Font, FontFallbacks, FontWeight, Keystroke, PathBuilder, ScrollHandle, SharedString,
+    StrikethroughStyle, StyledText, TextRun, UnderlineStyle, Window, WindowBounds, WindowOptions,
 };
 use gpui_platform::application;
 use std::path::PathBuf;
@@ -34,6 +35,18 @@ const HALF_PAGE_FALLBACK: usize = 20;
 const LIST_INDENT: f32 = 16.0;
 /// Indent added per nested blockquote level, in pixels.
 const QUOTE_INDENT: f32 = 12.0;
+
+/// Document sans with color-emoji fallback so GFM emoji in `example.md` render.
+fn ui_font() -> Font {
+    Font {
+        family: SharedString::from("Noto Sans"),
+        fallbacks: Some(FontFallbacks::from_fonts(vec![
+            "Noto Color Emoji".to_string(),
+            "Noto Sans Symbols 2".to_string(),
+        ])),
+        ..Font::default()
+    }
+}
 
 /// A vector stroke: polyline points, whether it's dashed, whether it's thick.
 type Stroke = (Vec<(f32, f32)>, bool, bool);
@@ -168,12 +181,31 @@ fn diagram_cache(doc: &markdown::Document) -> std::collections::HashMap<usize, m
 /// actual on-screen bounds, so every point must be offset by `bounds.origin`
 /// -- otherwise every diagram paints its edges pinned to the window's
 /// top-left corner instead of wherever the diagram actually scrolled to.
-fn paint_strokes(strokes: Vec<Stroke>, heads: Vec<ArrowHead>) -> impl IntoElement {
+fn paint_strokes(
+    fills: Vec<Vec<(f32, f32)>>,
+    strokes: Vec<Stroke>,
+    heads: Vec<ArrowHead>,
+) -> impl IntoElement {
     let line = rgb(theme::DIAGRAM_LINE);
+    let fill = rgb(theme::DIAGRAM_FILL);
     canvas(
         move |_, _, _| {},
         move |bounds, _, window, _| {
             let origin = bounds.origin;
+            for points in &fills {
+                if points.len() < 3 {
+                    continue;
+                }
+                let mut builder = PathBuilder::fill();
+                builder.move_to(origin + point(px(points[0].0), px(points[0].1)));
+                for p in points.iter().skip(1) {
+                    builder.line_to(origin + point(px(p.0), px(p.1)));
+                }
+                builder.close();
+                if let Ok(path) = builder.build() {
+                    window.paint_path(path, fill);
+                }
+            }
             for (points, dashed, thick) in &strokes {
                 let mut builder = PathBuilder::stroke(px(if *thick { 3.0 } else { 2.0 }));
                 if *dashed {
@@ -232,11 +264,24 @@ impl Viewer {
             .filter(|edge| edge.arrow)
             .map(|edge| mermaid::arrowhead(edge.tip, edge.tip_dir))
             .collect();
+        let fills: Vec<Vec<(f32, f32)>> = chart
+            .nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, node)| {
+                let poly = mermaid::shape_polygon(node.shape, &layout.boxes[index]);
+                if poly.is_empty() {
+                    None
+                } else {
+                    Some(poly)
+                }
+            })
+            .collect();
         let mut container = div()
             .relative()
             .w(px(layout.width))
             .h(px(layout.height))
-            .child(paint_strokes(outlines, heads));
+            .child(paint_strokes(fills, outlines, heads));
         for (index, node) in chart.nodes.iter().enumerate() {
             let rect = &layout.boxes[index];
             let label = div()
@@ -300,7 +345,7 @@ impl Viewer {
             .enumerate()
             .map(|(i, _)| {
                 let x = layout.col_x[i] + layout.col_w / 2.0;
-                (vec![(x, lifeline_top), (x, lifeline_bottom)], true, false)
+                (vec![(x, lifeline_top), (x, lifeline_bottom)], false, false)
             })
             .collect();
         let mut heads = Vec::new();
@@ -317,7 +362,7 @@ impl Viewer {
             .relative()
             .w(px(layout.width))
             .h(px(layout.height))
-            .child(paint_strokes(strokes, heads));
+            .child(paint_strokes(Vec::new(), strokes, heads));
         for (i, actor) in seq.actors.iter().enumerate() {
             // Each actor gets two boxes (top/bottom); suffix keeps ids unique.
             for (place, top) in [("top", box_top), ("bottom", lifeline_bottom)] {
@@ -430,7 +475,7 @@ impl Viewer {
             text.push_str(&span.text);
             let len = text.len() - start;
 
-            let mut font = Font::default();
+            let mut font = ui_font();
             if span.bold {
                 font = font.bold();
             }
@@ -482,13 +527,13 @@ impl Viewer {
             .mt_4()
             .mb_2()
             .font_weight(FontWeight::BOLD)
-            .text_color(rgb(theme::BLUE))
+            .text_color(rgb(theme::BODY))
             .child(self.build_styled_text(&markdown::spans(spans)));
         el = match level {
-            1 => el.text_2xl(),
-            2 => el.text_xl(),
-            3 => el.text_lg(),
-            _ => el.text_base(),
+            1 => el.text_3xl(),
+            2 => el.text_2xl(),
+            3 => el.text_xl(),
+            _ => el.text_lg(),
         };
         if level <= 2 {
             el = el.pb_1().border_b_1().border_color(rgb(theme::BORDER));
@@ -497,10 +542,134 @@ impl Viewer {
     }
 
     fn render_paragraph(&self, spans: &[markdown::Inline]) -> AnyElement {
-        div()
-            .mb_4()
-            .child(self.build_styled_text(&markdown::spans(spans)))
-            .into_any_element()
+        self.render_inline_flow(spans, true)
+    }
+
+    /// Flowing inlines: styled text, with display math broken out and centered
+    /// like the GitHub-style reference PDF.
+    fn render_inline_flow(&self, inlines: &[markdown::Inline], padded: bool) -> AnyElement {
+        if inlines
+            .iter()
+            .all(|inline| !matches!(inline, markdown::Inline::Math { .. }))
+        {
+            return div()
+                .when(padded, |el| el.mb_4())
+                .child(self.build_styled_text(&markdown::spans(inlines)))
+                .into_any_element();
+        }
+        let mut column = div().flex().flex_col().when(padded, |el| el.mb_4());
+        let mut buf: Vec<markdown::Inline> = Vec::new();
+        for inline in inlines {
+            match inline {
+                markdown::Inline::Math { display: true, tex } => {
+                    if !buf.is_empty() {
+                        column = column.child(self.render_inline_row(&std::mem::take(&mut buf)));
+                    }
+                    column = column.child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .justify_center()
+                            .py_3()
+                            .child(self.render_math(tex, true)),
+                    );
+                }
+                other => buf.push(other.clone()),
+            }
+        }
+        if !buf.is_empty() {
+            column = column.child(self.render_inline_row(&buf));
+        }
+        column.into_any_element()
+    }
+
+    fn render_inline_row(&self, inlines: &[markdown::Inline]) -> AnyElement {
+        let mut row = div().flex().flex_row().flex_wrap().items_center().gap_1();
+        let mut text_buf: Vec<markdown::Inline> = Vec::new();
+        for inline in inlines {
+            if let markdown::Inline::Math { display, tex } = inline {
+                if !text_buf.is_empty() {
+                    row = row.child(self.build_styled_text(&markdown::spans(&text_buf)));
+                    text_buf.clear();
+                }
+                row = row.child(self.render_math(tex, *display));
+            } else {
+                text_buf.push(inline.clone());
+            }
+        }
+        if !text_buf.is_empty() {
+            row = row.child(self.build_styled_text(&markdown::spans(&text_buf)));
+        }
+        row.into_any_element()
+    }
+
+    fn render_math(&self, tex: &str, display: bool) -> AnyElement {
+        let atom = math::parse_tex(tex);
+        let inner = self.render_atom(&atom, display);
+        if display {
+            div().text_lg().child(inner).into_any_element()
+        } else {
+            inner
+        }
+    }
+
+    fn render_atom(&self, atom: &math::Atom, display: bool) -> AnyElement {
+        let color = rgb(theme::BODY);
+        match atom {
+            math::Atom::Text(text) => div()
+                .text_color(color)
+                .child(text.clone())
+                .into_any_element(),
+            math::Atom::Row(items) => {
+                let mut row = div().flex().flex_row().items_center().gap_1();
+                for item in items {
+                    row = row.child(self.render_atom(item, display));
+                }
+                row.into_any_element()
+            }
+            math::Atom::Frac(num, den) => div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .px_1()
+                .child(self.render_atom(num, display))
+                .child(div().h(px(1.0)).w_full().bg(color).my(px(2.0)))
+                .child(self.render_atom(den, display))
+                .into_any_element(),
+            math::Atom::Scripts {
+                base,
+                sub,
+                sup,
+                limits,
+            } => {
+                if *limits && display {
+                    let mut col = div().flex().flex_col().items_center().px_1();
+                    if let Some(sup) = sup {
+                        col = col.child(div().text_sm().child(self.render_atom(sup, false)));
+                    }
+                    col = col.child(self.render_atom(base, display));
+                    if let Some(sub) = sub {
+                        col = col.child(div().text_sm().child(self.render_atom(sub, false)));
+                    }
+                    col.into_any_element()
+                } else {
+                    let mut scripts = div().flex().flex_col().items_center().text_sm().ml_1();
+                    if let Some(sup) = sup {
+                        scripts = scripts.child(self.render_atom(sup, false));
+                    }
+                    if let Some(sub) = sub {
+                        scripts = scripts.child(self.render_atom(sub, false));
+                    }
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .child(self.render_atom(base, display))
+                        .child(scripts)
+                        .into_any_element()
+                }
+            }
+        }
     }
 
     fn render_list_item(
@@ -525,10 +694,17 @@ impl Viewer {
                 .text_color(rgb(theme::FG_GUTTER))
                 .child(format!("{number}."))
                 .into_any_element(),
-            None => div()
-                .text_color(rgb(theme::FG_GUTTER))
-                .child("\u{2022}")
-                .into_any_element(),
+            None => {
+                let mark = match depth {
+                    0 => "\u{2022}",
+                    1 => "\u{25E6}",
+                    _ => "\u{25AA}",
+                };
+                div()
+                    .text_color(rgb(theme::FG_GUTTER))
+                    .child(mark)
+                    .into_any_element()
+            }
         };
         div()
             .flex()
@@ -690,37 +866,48 @@ impl Viewer {
         if self.doc.front_matter.is_empty() {
             return None;
         }
-        let mut container = div()
+        let last = self.doc.front_matter.len() - 1;
+        let mut table = div()
             .flex()
             .flex_col()
-            .gap_1()
-            .m_4()
-            .p_3()
+            .mb_4()
             .border_1()
             .border_color(rgb(theme::BORDER))
             .rounded_md()
             .bg(rgb(theme::BLOCK_BG));
-        for (key, value) in &self.doc.front_matter {
+        for (i, (key, value)) in self.doc.front_matter.iter().enumerate() {
             let key_el = div()
+                .w(px(120.0))
+                .px_3()
+                .py_2()
+                .border_r_1()
+                .border_color(rgb(theme::BORDER))
+                .flex()
+                .justify_end()
                 .text_color(rgb(theme::FG_GUTTER))
-                .child(format!("{key}:"));
-            let row = if key.eq_ignore_ascii_case("tags") {
-                let mut pills = div().flex().flex_row().flex_wrap().gap_2();
-                for tag in value.split(',').map(str::trim).filter(|t| !t.is_empty()) {
-                    pills = pills.child(self.pill(tag));
+                .child(key.clone());
+            let value_el: AnyElement = if key.eq_ignore_ascii_case("tags") {
+                let mut pills = div().flex().flex_row().flex_wrap().gap_2().px_3().py_2();
+                for tag in markdown::tag_list(value) {
+                    pills = pills.child(self.pill(&tag));
                 }
-                div().flex().flex_row().gap_2().child(key_el).child(pills)
+                pills.into_any_element()
             } else {
                 div()
-                    .flex()
-                    .flex_row()
-                    .gap_2()
-                    .child(key_el)
-                    .child(div().text_color(rgb(theme::BODY)).child(value.clone()))
+                    .flex_1()
+                    .px_3()
+                    .py_2()
+                    .text_color(rgb(theme::BODY))
+                    .child(value.clone())
+                    .into_any_element()
             };
-            container = container.child(row);
+            let mut row = div().flex().flex_row().items_stretch();
+            if i != last {
+                row = row.border_b_1().border_color(rgb(theme::BORDER));
+            }
+            table = table.child(row.child(key_el).child(value_el));
         }
-        Some(container.into_any_element())
+        Some(table.into_any_element())
     }
 }
 
@@ -785,6 +972,7 @@ impl Render for Viewer {
         div()
             .flex()
             .flex_col()
+            .font_family("Noto Sans")
             .bg(rgb(theme::BG))
             .size_full()
             .child(

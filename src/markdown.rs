@@ -79,6 +79,15 @@ pub enum Inline {
         alt: String,
         url: String,
     },
+    /// `$...$` / `$$...$$` TeX fragment. `display` is true for `$$`.
+    Math {
+        display: bool,
+        tex: String,
+    },
+    /// `^super^` or `<sup>`.
+    Super(Vec<Inline>),
+    /// `<sub>`.
+    Sub(Vec<Inline>),
     Break,
 }
 
@@ -101,6 +110,7 @@ pub fn parse_markdown(text: &str) -> Document {
     options.extension.superscript = true;
     options.extension.highlight = true;
     options.extension.insert = true;
+    options.extension.math_dollars = true;
     options.extension.front_matter_delimiter = Some("---".to_owned());
 
     let arena = Arena::new();
@@ -130,6 +140,26 @@ fn parse_front_matter(raw: &str) -> Vec<(String, String)> {
             let (key, value) = line.split_once(':')?;
             Some((key.trim().to_string(), value.trim().to_string()))
         })
+        .collect()
+}
+
+/// Split a YAML/plain tags value into pill labels.
+/// Accepts `a, b`, `[a, b]`, and `["a", "b"]`.
+pub fn tag_list(value: &str) -> Vec<String> {
+    let trimmed = value.trim();
+    let body = trimmed
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(trimmed);
+    body.split(',')
+        .map(|item| {
+            item.trim()
+                .trim_matches('"')
+                .trim_matches('\'')
+                .trim()
+                .to_string()
+        })
+        .filter(|item| !item.is_empty())
         .collect()
 }
 
@@ -220,11 +250,84 @@ fn convert_table<'a>(node: &'a AstNode<'a>, table: &NodeTable) -> Block {
 }
 
 fn inlines_of<'a>(node: &'a AstNode<'a>) -> Vec<Inline> {
-    let mut out = Vec::new();
+    let mut frames: Vec<(Option<HtmlWrap>, Vec<Inline>)> = vec![(None, Vec::new())];
     for child in node.children() {
-        collect_inline(child, &mut out);
+        if let NodeValue::HtmlInline(tag) = &child.data().value {
+            apply_html_tag(tag, &mut frames);
+        } else {
+            collect_inline(child, &mut frames.last_mut().unwrap().1);
+        }
     }
-    out
+    while frames.len() > 1 {
+        close_html_frame(&mut frames);
+    }
+    frames.pop().unwrap().1
+}
+
+/// Opening/closing HTML tags that wrap subsequent sibling inlines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HtmlWrap {
+    Mark,
+    Underline,
+    Sub,
+    Sup,
+    Kbd,
+}
+
+fn apply_html_tag(tag: &str, frames: &mut Vec<(Option<HtmlWrap>, Vec<Inline>)>) {
+    let trimmed = tag.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if let Some(kind) = html_open(&lower) {
+        frames.push((Some(kind), Vec::new()));
+        return;
+    }
+    if html_close(&lower).is_some() && frames.len() > 1 {
+        close_html_frame(frames);
+    }
+}
+
+fn html_open(tag: &str) -> Option<HtmlWrap> {
+    match tag {
+        "<mark>" => Some(HtmlWrap::Mark),
+        "<u>" | "<ins>" => Some(HtmlWrap::Underline),
+        "<sub>" => Some(HtmlWrap::Sub),
+        "<sup>" => Some(HtmlWrap::Sup),
+        "<kbd>" => Some(HtmlWrap::Kbd),
+        _ => None,
+    }
+}
+
+fn html_close(tag: &str) -> Option<HtmlWrap> {
+    match tag {
+        "</mark>" => Some(HtmlWrap::Mark),
+        "</u>" | "</ins>" => Some(HtmlWrap::Underline),
+        "</sub>" => Some(HtmlWrap::Sub),
+        "</sup>" => Some(HtmlWrap::Sup),
+        "</kbd>" => Some(HtmlWrap::Kbd),
+        _ => None,
+    }
+}
+
+fn close_html_frame(frames: &mut Vec<(Option<HtmlWrap>, Vec<Inline>)>) {
+    let Some((kind, inner)) = frames.pop() else {
+        return;
+    };
+    let wrapped = match kind {
+        Some(HtmlWrap::Mark) => Inline::Mark(inner),
+        Some(HtmlWrap::Underline) => Inline::Insert(inner),
+        Some(HtmlWrap::Sub) => Inline::Sub(inner),
+        Some(HtmlWrap::Sup) => Inline::Super(inner),
+        Some(HtmlWrap::Kbd) => Inline::Code(flatten(&inner)),
+        None => {
+            if let Some((_, parent)) = frames.last_mut() {
+                parent.extend(inner);
+            }
+            return;
+        }
+    };
+    if let Some((_, parent)) = frames.last_mut() {
+        parent.push(wrapped);
+    }
 }
 
 fn collect_inline<'a>(node: &'a AstNode<'a>, out: &mut Vec<Inline>) {
@@ -236,6 +339,11 @@ fn collect_inline<'a>(node: &'a AstNode<'a>, out: &mut Vec<Inline>) {
         NodeValue::Strikethrough => out.push(Inline::Strike(inlines_of(node))),
         NodeValue::Highlight => out.push(Inline::Mark(inlines_of(node))),
         NodeValue::Insert => out.push(Inline::Insert(inlines_of(node))),
+        NodeValue::Superscript => out.push(Inline::Super(inlines_of(node))),
+        NodeValue::Math(math) => out.push(Inline::Math {
+            display: math.display_math,
+            tex: math.literal.trim().to_string(),
+        }),
         NodeValue::Link(link) => out.push(Inline::Link {
             label: inlines_of(node),
             url: link.url.clone(),
@@ -269,9 +377,12 @@ fn push_flat(inlines: &[Inline], out: &mut String) {
             | Inline::Strong(inner)
             | Inline::Strike(inner)
             | Inline::Mark(inner)
-            | Inline::Insert(inner) => {
+            | Inline::Insert(inner)
+            | Inline::Super(inner)
+            | Inline::Sub(inner) => {
                 push_flat(inner, out);
             }
+            Inline::Math { tex, .. } => out.push_str(&crate::math::flatten_tex(tex)),
             Inline::Link { label, url } => {
                 push_flat(label, out);
                 if !url.is_empty() {
@@ -403,6 +514,23 @@ impl SpanStyle {
     }
 }
 
+/// True when any inline is display (`$$`) math.
+#[cfg(test)]
+pub fn has_display_math(inlines: &[Inline]) -> bool {
+    inlines.iter().any(|inline| match inline {
+        Inline::Math { display: true, .. } => true,
+        Inline::Emph(inner)
+        | Inline::Strong(inner)
+        | Inline::Strike(inner)
+        | Inline::Mark(inner)
+        | Inline::Insert(inner)
+        | Inline::Super(inner)
+        | Inline::Sub(inner) => has_display_math(inner),
+        Inline::Link { label, .. } => has_display_math(label),
+        _ => false,
+    })
+}
+
 /// Flatten inline runs into styled [`Span`]s for rich rendering. Adjacent
 /// runs that end up with identical styling are merged into one span.
 pub fn spans(inlines: &[Inline]) -> Vec<Span> {
@@ -485,7 +613,18 @@ fn push_spans(inlines: &[Inline], style: SpanStyle, out: &mut Vec<Span>) {
                 },
                 out,
             ),
-            Inline::Link { label, url } => {
+            Inline::Super(inner) => {
+                let text = flatten(inner);
+                push_span(out, style, crate::math::unicode_script(&text, true));
+            }
+            Inline::Sub(inner) => {
+                let text = flatten(inner);
+                push_span(out, style, crate::math::unicode_script(&text, false));
+            }
+            Inline::Math { tex, .. } => {
+                push_span(out, style, crate::math::flatten_tex(tex));
+            }
+            Inline::Link { label, url: _ } => {
                 push_spans(
                     label,
                     SpanStyle {
@@ -494,9 +633,6 @@ fn push_spans(inlines: &[Inline], style: SpanStyle, out: &mut Vec<Span>) {
                     },
                     out,
                 );
-                if !url.is_empty() {
-                    push_span(out, style, format!(" ({url})"));
-                }
             }
             Inline::Image { alt, url } => {
                 if !alt.is_empty() {
@@ -639,6 +775,79 @@ mod tests {
     }
 
     #[test]
+    fn yaml_tag_arrays_strip_brackets_and_quotes() {
+        assert_eq!(
+            tag_list(r#"["markdown", "live-preview", "gfm"]"#),
+            vec!["markdown", "live-preview", "gfm"]
+        );
+        assert_eq!(tag_list("a, b"), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn html_mark_underline_sub_and_sup() {
+        let doc = parse_markdown(
+            "use <mark>highlighted text</mark> or <u>underlines</u> H<sub>2</sub>O x<sup>2</sup>\n",
+        );
+        let Block::Paragraph(inlines) = &doc.blocks[0] else {
+            panic!("expected paragraph");
+        };
+        assert!(
+            inlines.iter().any(|i| matches!(i, Inline::Mark(_))),
+            "{inlines:?}"
+        );
+        assert!(
+            inlines.iter().any(|i| matches!(i, Inline::Insert(_))),
+            "{inlines:?}"
+        );
+        assert!(
+            inlines.iter().any(|i| matches!(i, Inline::Sub(_))),
+            "{inlines:?}"
+        );
+        assert!(
+            inlines.iter().any(|i| matches!(i, Inline::Super(_))),
+            "{inlines:?}"
+        );
+        let runs = spans(inlines);
+        assert!(
+            runs.iter()
+                .any(|s| s.mark && s.text.contains("highlighted")),
+            "{runs:?}"
+        );
+        assert!(
+            runs.iter()
+                .any(|s| s.insert && s.text.contains("underlines")),
+            "{runs:?}"
+        );
+        assert!(
+            runs.iter().any(|s| s.text.contains('₂')),
+            "subscript: {runs:?}"
+        );
+        assert!(
+            runs.iter().any(|s| s.text.contains('²')),
+            "superscript: {runs:?}"
+        );
+    }
+
+    #[test]
+    fn dollar_math_is_a_math_inline() {
+        let doc = parse_markdown("Inline equation: $$E = mc^2$$\n");
+        let Block::Paragraph(inlines) = &doc.blocks[0] else {
+            panic!("expected paragraph");
+        };
+        assert!(
+            inlines.iter().any(|i| matches!(
+                i,
+                Inline::Math {
+                    display: true,
+                    tex
+                } if tex.contains("E = mc^2")
+            )),
+            "{inlines:?}"
+        );
+        assert!(has_display_math(inlines));
+    }
+
+    #[test]
     fn quote_rule_and_skipped_html() {
         let doc = parse_markdown("> quoted\n\n---\n\n<div>x</div>\n");
         assert!(matches!(doc.blocks[0], Block::Quote(_)));
@@ -719,9 +928,8 @@ mod tests {
         assert!(runs.iter().any(|s| s.code && s.text == "code"));
         assert!(runs.iter().any(|s| s.link && s.text == "x"));
         assert!(
-            runs.iter()
-                .any(|s| !s.link && s.text.contains("https://y.test")),
-            "runs: {runs:?}"
+            runs.iter().all(|s| !s.text.contains("https://y.test")),
+            "visual spans must not append the URL: {runs:?}"
         );
     }
 
