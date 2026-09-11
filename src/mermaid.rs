@@ -12,7 +12,7 @@
 //! Layout is layered ranks for flowcharts and columns/rows for sequences.
 //! All geometry is pure and unit-tested; rendering lives in `main`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub const CHAR_W: f32 = 8.0;
 pub const NODE_H: f32 = 36.0;
@@ -599,39 +599,90 @@ pub fn node_width(label: &str) -> f32 {
     (NODE_MIN_W).max(NODE_PAD_X * 2.0 + chars * CHAR_W)
 }
 
-/// Layered layout: rank by longest path from sources, centered rows.
-pub fn layout_flowchart(chart: &Flowchart) -> FlowLayout {
-    let count = chart.nodes.len();
+/// Longest-path ranks on the DAG of forward edges. Back-edges (cycles such
+/// as a Debug→diamond loop) are ignored so they cannot inflate ranks.
+fn flow_ranks(count: usize, edges: &[FEdge]) -> Vec<usize> {
+    let mut adj = vec![Vec::new(); count];
+    for edge in edges {
+        adj[edge.from].push(edge.to);
+    }
+    let back = back_edges(count, &adj);
+    let mut fwd = vec![Vec::new(); count];
+    let mut indeg = vec![0usize; count];
+    for edge in edges {
+        if back.contains(&(edge.from, edge.to)) {
+            continue;
+        }
+        fwd[edge.from].push(edge.to);
+        indeg[edge.to] += 1;
+    }
     let mut rank = vec![0usize; count];
-    for _ in 0..count {
-        for edge in &chart.edges {
-            let next = rank[edge.from] + 1;
-            if next > rank[edge.to] {
-                rank[edge.to] = next;
+    let mut queue: Vec<usize> = (0..count).filter(|&i| indeg[i] == 0).collect();
+    let mut i = 0;
+    while i < queue.len() {
+        let u = queue[i];
+        i += 1;
+        for &v in &fwd[u] {
+            rank[v] = rank[v].max(rank[u] + 1);
+            indeg[v] -= 1;
+            if indeg[v] == 0 {
+                queue.push(v);
             }
         }
     }
+    rank
+}
+
+fn back_edges(count: usize, adj: &[Vec<usize>]) -> HashSet<(usize, usize)> {
+    let mut color = vec![0u8; count];
+    let mut back = HashSet::new();
+    fn dfs(u: usize, adj: &[Vec<usize>], color: &mut [u8], back: &mut HashSet<(usize, usize)>) {
+        color[u] = 1;
+        for &v in &adj[u] {
+            match color[v] {
+                0 => dfs(v, adj, color, back),
+                1 => {
+                    back.insert((u, v));
+                }
+                _ => {}
+            }
+        }
+        color[u] = 2;
+    }
+    for i in 0..count {
+        if color[i] == 0 {
+            dfs(i, adj, &mut color, &mut back);
+        }
+    }
+    back
+}
+
+fn node_box_size(node: &FNode) -> (f32, f32) {
+    let mut width = node_width(&node.label);
+    let mut height = NODE_H;
+    match node.shape {
+        Shape::Circle => {
+            width = width.max(NODE_H);
+        }
+        Shape::Diamond => {
+            width = (width * 1.45).max(160.0);
+            height = NODE_H * 2.6;
+        }
+        _ => {}
+    }
+    (width, height)
+}
+
+/// Layered layout: rank by longest path from sources, centered rows.
+pub fn layout_flowchart(chart: &Flowchart) -> FlowLayout {
+    let count = chart.nodes.len();
+    let rank = flow_ranks(count, &chart.edges);
     let depth = rank.iter().copied().max().unwrap_or(0);
     let mut rows: Vec<Vec<usize>> = vec![Vec::new(); depth + 1];
     for (index, _) in chart.nodes.iter().enumerate() {
         rows[rank[index]].push(index);
     }
-    let widths: Vec<f32> = chart
-        .nodes
-        .iter()
-        .map(|node| {
-            let mut width = node_width(&node.label);
-            if node.shape == Shape::Circle {
-                width = width.max(NODE_H);
-            }
-            width
-        })
-        .collect();
-    let row_width = |row: &[usize]| {
-        row.iter().map(|&i| widths[i]).sum::<f32>() + GAP_X * row.len().saturating_sub(1) as f32
-    };
-    let total_w = rows.iter().map(|row| row_width(row)).fold(0.0f32, f32::max);
-    let total_h = (depth + 1) as f32 * NODE_H + depth as f32 * GAP_Y;
+    let sizes: Vec<(f32, f32)> = chart.nodes.iter().map(node_box_size).collect();
     let mut boxes = vec![
         Rect {
             x: 0.0,
@@ -641,48 +692,87 @@ pub fn layout_flowchart(chart: &Flowchart) -> FlowLayout {
         };
         count
     ];
-    for (depth_index, row) in rows.iter().enumerate() {
-        let mut x = PAD + (total_w - row_width(row)) / 2.0;
-        let y = PAD + depth_index as f32 * (NODE_H + GAP_Y);
-        for &index in row {
-            boxes[index] = Rect {
-                x,
-                y,
-                w: widths[index],
-                h: NODE_H,
-            };
-            x += widths[index] + GAP_X;
+    let horizontal = matches!(chart.direction, FlowDir::LeftRight | FlowDir::RightLeft);
+    let (width, height) = if horizontal {
+        // Ranks are columns: x grows by each column's max width so a wide
+        // diamond cannot overlap the next rank (swapping x/y of a TD layout
+        // would keep the diamond's width on the rank axis).
+        let col_ws: Vec<f32> = rows
+            .iter()
+            .map(|row| row.iter().map(|&i| sizes[i].0).fold(0.0f32, f32::max))
+            .collect();
+        let col_hs: Vec<f32> = rows
+            .iter()
+            .map(|row| {
+                row.iter().map(|&i| sizes[i].1).sum::<f32>()
+                    + GAP_Y * 0.6 * row.len().saturating_sub(1) as f32
+            })
+            .collect();
+        let total_h = col_hs.iter().copied().fold(NODE_H, f32::max);
+        let mut x = PAD;
+        for (depth_index, row) in rows.iter().enumerate() {
+            let col_w = col_ws[depth_index];
+            let mut y = PAD + (total_h - col_hs[depth_index]) / 2.0;
+            for &index in row {
+                let (w, h) = sizes[index];
+                boxes[index] = Rect {
+                    x: x + (col_w - w) / 2.0,
+                    y,
+                    w,
+                    h,
+                };
+                y += h + GAP_Y * 0.6;
+            }
+            x += col_w + GAP_X;
         }
-    }
+        if chart.direction == FlowDir::RightLeft {
+            let width = x + PAD - GAP_X;
+            for rect in &mut boxes {
+                rect.x = width - rect.x - rect.w;
+            }
+        }
+        (x + PAD - GAP_X, total_h + PAD * 2.0)
+    } else {
+        let row_width = |row: &[usize]| {
+            row.iter().map(|&i| sizes[i].0).sum::<f32>()
+                + GAP_X * row.len().saturating_sub(1) as f32
+        };
+        let row_heights: Vec<f32> = rows
+            .iter()
+            .map(|row| row.iter().map(|&i| sizes[i].1).fold(NODE_H, f32::max))
+            .collect();
+        let total_w = rows.iter().map(|row| row_width(row)).fold(0.0f32, f32::max);
+        let total_h = row_heights.iter().sum::<f32>() + GAP_Y * depth as f32;
+        let mut y = PAD;
+        for (depth_index, row) in rows.iter().enumerate() {
+            let mut x = PAD + (total_w - row_width(row)) / 2.0;
+            let row_h = row_heights[depth_index];
+            for &index in row {
+                let (w, h) = sizes[index];
+                boxes[index] = Rect {
+                    x,
+                    y: y + (row_h - h) / 2.0,
+                    w,
+                    h,
+                };
+                x += w + GAP_X;
+            }
+            y += row_h + GAP_Y;
+        }
+        if chart.direction == FlowDir::BottomUp {
+            let height = total_h + PAD * 2.0;
+            for rect in &mut boxes {
+                rect.y = height - rect.y - rect.h;
+            }
+        }
+        (total_w + PAD * 2.0, total_h + PAD * 2.0)
+    };
     let mut layout = FlowLayout {
         boxes,
         edges: Vec::new(),
-        width: total_w + PAD * 2.0,
-        height: total_h + PAD * 2.0,
+        width,
+        height,
     };
-    // Orient: BottomUp flips vertically, LeftRight/RightLeft transpose.
-    match chart.direction {
-        FlowDir::TopDown => {}
-        FlowDir::BottomUp => {
-            for rect in &mut layout.boxes {
-                rect.y = layout.height - rect.y - rect.h;
-            }
-        }
-        FlowDir::LeftRight | FlowDir::RightLeft => {
-            // Swap axes so ranks run left-to-right and same-rank nodes
-            // stack top-to-bottom, without rotating each node's own box
-            // (labels keep their natural width and fixed height).
-            for rect in &mut layout.boxes {
-                std::mem::swap(&mut rect.x, &mut rect.y);
-            }
-            std::mem::swap(&mut layout.width, &mut layout.height);
-            if chart.direction == FlowDir::RightLeft {
-                for rect in &mut layout.boxes {
-                    rect.x = layout.width - rect.x - rect.w;
-                }
-            }
-        }
-    }
     layout.edges = chart
         .edges
         .iter()
@@ -794,7 +884,7 @@ pub fn layout_sequence(seq: &Sequence) -> SeqLayout {
         + seq.actors.len() as f32 * col_w
         + seq.actors.len().saturating_sub(1) as f32 * SEQ_COL_GAP;
     let height =
-        PAD + SEQ_TOP_H + SEQ_COL_GAP / 2.0 + seq.events.len() as f32 * SEQ_ROW_H + SEQ_TOP_H / 2.0;
+        PAD + SEQ_TOP_H + SEQ_COL_GAP / 2.0 + seq.events.len() as f32 * SEQ_ROW_H + SEQ_TOP_H + PAD;
     SeqLayout {
         col_x,
         col_w,
@@ -1020,6 +1110,25 @@ mod tests {
         }
         // Diamond branch targets share a rank below the diamond.
         assert_eq!(layout.boxes[2].y, layout.boxes[3].y);
+    }
+
+    #[test]
+    fn cycle_back_edge_does_not_inflate_lr_ranks() {
+        let chart = flow(
+            "flowchart LR\nA[Start] --> B{Is it working?}\nB -->|Yes| C[Great!]\nB -->|No| D[Debug]\nC --> E[Deploy]\nD --> B\n",
+        );
+        let layout = layout_flowchart(&chart);
+        // Start left of the diamond; Yes/No targets share a column; Deploy further right.
+        assert!(layout.boxes[0].x < layout.boxes[1].x);
+        assert!(layout.boxes[1].x < layout.boxes[2].x);
+        assert!((layout.boxes[2].x - layout.boxes[3].x).abs() < 40.0);
+        assert!(layout.boxes[4].x > layout.boxes[2].x);
+        assert!(layout.boxes[2].y < layout.boxes[3].y);
+        assert!(
+            layout.width < 900.0,
+            "cycle inflated width: {}",
+            layout.width
+        );
     }
 
     #[test]

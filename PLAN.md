@@ -22,11 +22,17 @@ flowcharts/sequences natively with GPUI (no external renderer).
 
 ## Context And Current Facts
 
-- Workspace has only `README.md` (viewer, vim bindings, re-render on change,
-  mermaid, highlighting) and 4-page `rendered-exmaple.pdf` (dark GitHub-style
-  reference: frontmatter table, tag pills, H2 rules, code blocks, LaTeX-style
-  math display, flowchart + sequence diagrams, task lists, comparison tables,
-  mark/kbd, lists, links, blockquote).
+- Visual fixture (use this to check that the viewer renders Markdown as
+  expected; the PDF is a multi-page export of the same file, not a
+  requirement that the app paginate): `example.md` is the source covering
+  YAML front matter, GFM, fenced code, `$$` math, mermaid flowchart +
+  sequence, task lists, comparison tables, mark/underline/sub/sup, nested
+  lists, links, and blockquotes. `example-rendered.pdf` is the 4-page dark
+  GitHub-style reference of that file (frontmatter table, tag pills, H2
+  rules, code chrome, LaTeX-style math, diagrams, tasks, tables, formatting).
+  Open with `md-view example.md` and compare the window to those four pages.
+- Workspace also has `README.md` (viewer, vim bindings, re-render on change,
+  mermaid, highlighting), `demo.md`, and the Cargo/GPUI project under `src/`.
 - Neovim theme is `tokyo_custom` at
   `~/.config/nvim/lua/colors/tokyo_custom.lua`: bg `#1a1b26`, fg `#c0caf5`,
   comment `#565f89` italic, string `#9ece6a`, const/number `#ff9e64`,
@@ -34,7 +40,6 @@ flowcharts/sequences natively with GPUI (no external renderer).
   operator `#89ddff`.
 - Prior user decisions: GPUI UI, single watched file, native-GUI image-capable
   path replaced by native GPUI diagram drawing, Wayland-only target.
-- No Cargo project exists yet; this is greenfield binary work.
 
 ## Constraints And Non-goals
 
@@ -101,10 +106,14 @@ the scroll/selection layer; yank goes through GPUI clipboard.
 - Unit: comrak AST mapping (tables, task lists, fallback), mermaid subset
   parser (flowchart + sequence golden scenes), theme token mapping from
   `tokyo_custom` hex values.
-- Manual on Wayland: open sample covering all 4 PDF pages; edit-save shows
-  update preserving position; delete/replace shows banner then recovers;
-  `j/gg/G///y` in normal/VISUAL verified by pasting into another app;
-  unsupported mermaid shows code fallback.
+- Visual: `md-view example.md` against `example-rendered.pdf` pages 1-4
+  (frontmatter table, tag pills, headings, code, math, mermaid, tasks,
+  tables, formatting). The PDF is paginated; the viewer should scroll one
+  document, not paginate.
+- Manual on Wayland: open `example.md` covering all 4 PDF pages; edit-save
+  shows update preserving position; delete/replace shows banner then
+  recovers; `j/gg/G///y` in normal/VISUAL verified by pasting into another
+  app; unsupported mermaid shows code fallback.
 - Highest risk: GPUI git-rev build + Wayland window launch; validate in
   unit 1 before deeper work.
 

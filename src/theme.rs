@@ -1,8 +1,8 @@
 //! Dark theme values for `md-view`.
 //!
-//! `ui` / document chrome follows `rendered-exmaple.pdf` (dark GitHub-style
-//! reference); code token colors follow the Neovim `tokyo_custom` palette in
-//! `~/.config/nvim/lua/colors/tokyo_custom.lua`.
+//! `ui` / document chrome follows `example-rendered.pdf` (dark GitHub-style
+//! reference of `example.md`); code token colors follow the Neovim
+//! `tokyo_custom` palette in `~/.config/nvim/lua/colors/tokyo_custom.lua`.
 
 /// Window background (`tokyo_custom` `bg`).
 pub const BG: u32 = 0x1a1b26;
@@ -25,12 +25,13 @@ pub const TYPE: u32 = 0x2ac3de;
 /// Operators and punctuation (`tokyo_custom` turquoise).
 pub const OPERATOR: u32 = 0x89ddff;
 /// Links and headings accent (`tokyo_custom` blue).
+#[allow(dead_code)]
 pub const BLUE: u32 = 0x7aa2f7;
 /// Visual selection background (`tokyo_custom` `bg_selection`).
 pub const BG_SELECTION: u32 = 0x283457;
 
 // ---------------------------------------------------------------------------
-// Document chrome sampled from `rendered-exmaple.pdf` (150 DPI render).
+// Document chrome sampled from `example-rendered.pdf` (150 DPI render).
 // These govern page, block, table, link, highlight, and diagram colors;
 // code token colors above stay on the Neovim palette by design.
 // ---------------------------------------------------------------------------
