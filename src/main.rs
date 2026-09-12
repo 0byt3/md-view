@@ -100,6 +100,7 @@ fn map_keystroke(stroke: &Keystroke) -> Option<vim::Key> {
         "up" => Some(vim::Key::Up),
         "down" => Some(vim::Key::Down),
         " " | "space" => Some(vim::Key::Char(' ')),
+        "/" if stroke.modifiers.shift => Some(vim::Key::Char('?')),
         _ => typed_char(stroke).map(vim::Key::Char),
     }
 }
@@ -156,6 +157,10 @@ impl Viewer {
         } else {
             String::new()
         }
+    }
+
+    fn help_open(&self) -> bool {
+        matches!(self.vim.mode, vim::Mode::Help)
     }
 
     fn status(&self) -> String {
@@ -1008,6 +1013,129 @@ impl Viewer {
         }
         Some(table.into_any_element())
     }
+
+    /// Compact filename strip: half the previous two-row header (empty
+    /// `text_lg` banner plus path). `? help` sits on the right.
+    fn render_title_bar(&self) -> AnyElement {
+        let label = if self.missing {
+            self.banner()
+        } else {
+            self.path_display.to_string()
+        };
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .h(px(28.))
+            .px_4()
+            .text_sm()
+            .text_color(rgb(theme::FG_GUTTER))
+            .child(label)
+            .child(self.render_help_hint())
+            .into_any_element()
+    }
+
+    fn render_help_hint(&self) -> AnyElement {
+        let (key, caption) = if self.help_open() {
+            ("esc", "close")
+        } else {
+            ("?", "help")
+        };
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_1()
+            .child(
+                div()
+                    .px_1()
+                    .border_1()
+                    .border_color(rgb(theme::BORDER))
+                    .rounded_md()
+                    .bg(rgb(theme::BLOCK_BG))
+                    .text_color(rgb(theme::BODY))
+                    .child(key),
+            )
+            .child(caption)
+            .into_any_element()
+    }
+
+    fn render_help(&self) -> AnyElement {
+        let mut body = div().flex().flex_col().gap_3().p_4();
+        body = body.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .child(div().text_color(rgb(theme::BODY)).child("Keybindings"))
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(theme::FG_GUTTER))
+                        .child("Esc / q / ? close"),
+                ),
+        );
+        for section in vim::HELP_SECTIONS {
+            let mut block = div().flex().flex_col().gap_1();
+            block = block.child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(theme::LINK))
+                    .child(section.title),
+            );
+            for (keys, desc) in section.rows {
+                block = block.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .gap_4()
+                        .child(
+                            div()
+                                .font_family("DejaVu Sans Mono")
+                                .text_sm()
+                                .text_color(rgb(theme::BODY))
+                                .child(*keys),
+                        )
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(rgb(theme::FG_GUTTER))
+                                .child(*desc),
+                        ),
+                );
+            }
+            body = body.child(block);
+        }
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .bottom_0()
+            .flex()
+            .justify_center()
+            .items_start()
+            .pt_4()
+            .occlude()
+            .bg(rgb(theme::PAGE_BG))
+            .child(
+                div()
+                    .id("help")
+                    .w(px(520.))
+                    .max_h(px(560.))
+                    .overflow_y_scroll()
+                    .border_1()
+                    .border_color(rgb(theme::BORDER))
+                    .rounded_md()
+                    .bg(rgb(theme::BLOCK_BG))
+                    .child(body),
+            )
+            .into_any_element()
+    }
 }
 
 /// Wrap a row in a left border/indent per nested `>` level. Depth 0 (not in
@@ -1073,28 +1201,23 @@ impl Render for Viewer {
             .font_family("Noto Sans")
             .bg(rgb(theme::BG))
             .size_full()
+            .child(self.render_title_bar())
             .child(
                 div()
-                    .px_4()
-                    .pt_2()
-                    .text_lg()
-                    .text_color(rgb(theme::FG_GUTTER))
-                    .child(self.banner()),
-            )
-            .child(
-                div()
-                    .px_4()
-                    .text_color(rgb(theme::FG_GUTTER))
-                    .child(self.path_display.clone()),
-            )
-            .children(self.render_front_matter())
-            .child(doc_body)
-            .child(
-                div()
-                    .px_4()
-                    .py_1()
-                    .text_color(rgb(theme::FG_GUTTER))
-                    .child(self.status()),
+                    .relative()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .children(self.render_front_matter())
+                    .child(doc_body)
+                    .child(
+                        div()
+                            .px_4()
+                            .py_1()
+                            .text_color(rgb(theme::FG_GUTTER))
+                            .child(self.status()),
+                    )
+                    .when(self.help_open(), |el| el.child(self.render_help())),
             )
     }
 }
@@ -1157,9 +1280,12 @@ fn main() {
                         view.snap_cursor_if_offscreen();
                     }
                     let half = view.half_page();
+                    let help_before = view.help_open();
                     match view.vim.handle_key(&view.lines, key, half) {
                         vim::Outcome::Changed => {
-                            view.follow_cursor = true;
+                            if !help_before && !view.help_open() {
+                                view.follow_cursor = true;
+                            }
                             cx.notify();
                         }
                         vim::Outcome::Ignored => {}

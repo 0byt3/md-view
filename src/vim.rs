@@ -251,7 +251,63 @@ pub enum Mode {
     Normal,
     Visual { anchor: Pos, linewise: bool },
     Search { query: String },
+    Help,
 }
+
+/// One labeled group of keybindings shown on the help overlay.
+#[derive(Debug, Clone, Copy)]
+pub struct HelpSection {
+    pub title: &'static str,
+    pub rows: &'static [(&'static str, &'static str)],
+}
+
+/// Keybindings grouped for the `?` help screen. Keep this in lockstep with
+/// [`Vim::handle_key`]: the overlay is the user-facing map of that machine.
+pub const HELP_SECTIONS: &[HelpSection] = &[
+    HelpSection {
+        title: "Scroll",
+        rows: &[
+            ("j  /  ↓", "Scroll down"),
+            ("k  /  ↑", "Scroll up"),
+            ("Ctrl-d", "Half page down"),
+            ("Ctrl-u", "Half page up"),
+            ("gg", "Jump to the top"),
+            ("G", "Jump to the bottom"),
+            ("nG", "Jump to line n"),
+        ],
+    },
+    HelpSection {
+        title: "Search",
+        rows: &[
+            ("/", "Search for text"),
+            ("n", "Next match"),
+            ("N", "Previous match"),
+            ("Enter", "Run the search"),
+            ("Esc", "Cancel the search"),
+        ],
+    },
+    HelpSection {
+        title: "Selection",
+        rows: &[
+            ("v", "Visual mode: highlight items"),
+            ("V", "Visual-line mode: highlight lines"),
+            ("j  /  k", "Extend the selection"),
+            ("y", "Copy the selection to the clipboard"),
+            ("yy", "Copy the current line"),
+            ("Esc", "Leave visual mode"),
+        ],
+    },
+    HelpSection {
+        title: "Other",
+        rows: &[
+            ("0", "Move to the start of the line"),
+            ("3j", "Counts work with motions (example)"),
+            ("?", "Open or close this help screen"),
+            ("q  /  Esc", "Close help"),
+            ("Ctrl-c", "Cancel pending keys"),
+        ],
+    },
+];
 
 /// Vim navigation state.
 pub struct Vim {
@@ -297,6 +353,7 @@ impl Vim {
             Mode::Normal => "-- NORMAL --",
             Mode::Visual { linewise, .. } if *linewise => "-- VISUAL LINE --",
             Mode::Visual { .. } => "-- VISUAL --",
+            Mode::Help => "-- HELP --",
             Mode::Search { query } => return format!("/{query}"),
         };
         match self.count {
@@ -313,6 +370,7 @@ impl Vim {
             Mode::Visual { anchor, linewise } => {
                 self.visual_key(lines, key, anchor, linewise, half)
             }
+            Mode::Help => self.help_key(key),
             Mode::Normal => self.normal_key(lines, key, half),
         }
     }
@@ -470,6 +528,12 @@ impl Vim {
                             Outcome::Changed
                         }
                     }
+                    Key::Char('?') => {
+                        self.message.clear();
+                        self.pending_g = false;
+                        self.mode = Mode::Help;
+                        Outcome::Changed
+                    }
                     _ => {
                         self.message.clear();
                         Outcome::Ignored
@@ -552,6 +616,17 @@ impl Vim {
                     }
                 }
             }
+        }
+    }
+
+    fn help_key(&mut self, key: Key) -> Outcome {
+        match key {
+            Key::Esc | Key::Char('q') | Key::Char('?') => {
+                self.mode = Mode::Normal;
+                self.message.clear();
+                Outcome::Changed
+            }
+            _ => Outcome::Ignored,
         }
     }
 
@@ -951,6 +1026,40 @@ mod tests {
         // Block ownership underpins per-block highlight/diagram rendering.
         assert_ne!(lines[0].block, lines[1].block);
         assert_eq!(lines[1].block, lines[2].block);
+    }
+
+    #[test]
+    fn question_opens_help_and_esc_q_close_it() {
+        let lines = doc_lines("# a\n");
+        let mut vim = Vim::new();
+        press(&mut vim, &lines, Key::Char('?'));
+        assert_eq!(vim.mode, Mode::Help);
+        assert_eq!(vim.status(), "-- HELP --");
+        press(&mut vim, &lines, Key::Esc);
+        assert_eq!(vim.mode, Mode::Normal);
+        press(&mut vim, &lines, Key::Char('?'));
+        press(&mut vim, &lines, Key::Char('q'));
+        assert_eq!(vim.mode, Mode::Normal);
+        press(&mut vim, &lines, Key::Char('?'));
+        press(&mut vim, &lines, Key::Char('?'));
+        assert_eq!(vim.mode, Mode::Normal);
+        press(&mut vim, &lines, Key::Char('/'));
+        press(&mut vim, &lines, Key::Char('?'));
+        assert!(matches!(vim.mode, Mode::Search { query } if query == "?"));
+    }
+
+    #[test]
+    fn help_sections_cover_core_bindings() {
+        let titles: Vec<&str> = HELP_SECTIONS.iter().map(|section| section.title).collect();
+        assert!(titles.contains(&"Scroll"));
+        assert!(titles.contains(&"Selection"));
+        let keys: Vec<&str> = HELP_SECTIONS
+            .iter()
+            .flat_map(|section| section.rows.iter().map(|(key, _)| *key))
+            .collect();
+        assert!(keys.iter().any(|key| key.contains('j')));
+        assert!(keys.iter().any(|key| *key == "v" || key.contains('V')));
+        assert!(keys.iter().any(|key| key.contains('?')));
     }
 
     #[test]
