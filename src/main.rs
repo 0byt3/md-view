@@ -1065,6 +1065,10 @@ impl Viewer {
         let mut body = div().flex().flex_col().gap_2().p_4();
         body = body.child(
             div()
+                .pb_2()
+                .mb_1()
+                .border_b_1()
+                .border_color(rgb(theme::BORDER))
                 .flex()
                 .flex_row()
                 .items_center()
