@@ -665,12 +665,132 @@ fn node_box_size(node: &FNode) -> (f32, f32) {
             width = width.max(NODE_H);
         }
         Shape::Diamond => {
-            width = (width * 1.45).max(160.0);
-            height = NODE_H * 2.6;
+            width = (width * 1.35).max(148.0);
+            height = NODE_H * 1.85;
         }
         _ => {}
     }
     (width, height)
+}
+
+/// Horizontal (LR/RL) ranks are columns. X grows by each column's max width
+/// so a wide diamond cannot overlap the next rank. Y uses a left-to-right
+/// barycenter of forward edges so a Yes/No branch column (Great! above Debug)
+/// can pull Start and the diamond onto the mid-lane, while Deploy stays on
+/// the Yes lane.
+fn layout_flow_columns(
+    chart: &Flowchart,
+    rows: &[Vec<usize>],
+    sizes: &[(f32, f32)],
+    boxes: &mut [Rect],
+) -> (f32, f32) {
+    let count = chart.nodes.len();
+    let gap_x = GAP_X + 28.0;
+    let col_ws: Vec<f32> = rows
+        .iter()
+        .map(|row| row.iter().map(|&i| sizes[i].0).fold(0.0f32, f32::max))
+        .collect();
+    let mut col_x = vec![0.0f32; rows.len()];
+    let mut x = PAD;
+    for (depth_index, &col_w) in col_ws.iter().enumerate() {
+        col_x[depth_index] = x;
+        x += col_w + gap_x;
+    }
+    let width = x + PAD - gap_x;
+
+    let back = {
+        let mut adj = vec![Vec::new(); count];
+        for edge in &chart.edges {
+            adj[edge.from].push(edge.to);
+        }
+        back_edges(count, &adj)
+    };
+    let mut incoming: Vec<Vec<usize>> = vec![Vec::new(); count];
+    for edge in &chart.edges {
+        if back.contains(&(edge.from, edge.to)) {
+            continue;
+        }
+        incoming[edge.to].push(edge.from);
+    }
+
+    let mut center_y = vec![0.0f32; count];
+    let mut placed = vec![false; count];
+    for (depth_index, row) in rows.iter().enumerate() {
+        let mut prev_bottom = f32::NEG_INFINITY;
+        for &index in row {
+            let (w, h) = sizes[index];
+            let pred_ys: Vec<f32> = incoming[index]
+                .iter()
+                .filter(|&&pred| placed[pred])
+                .map(|&pred| center_y[pred])
+                .collect();
+            let desired = if pred_ys.is_empty() {
+                PAD + h / 2.0
+            } else {
+                pred_ys.iter().sum::<f32>() / pred_ys.len() as f32
+            };
+            let min_center = if prev_bottom.is_finite() {
+                prev_bottom + GAP_Y + 12.0 + h / 2.0
+            } else {
+                f32::NEG_INFINITY
+            };
+            let cy = desired.max(min_center);
+            center_y[index] = cy;
+            placed[index] = true;
+            boxes[index] = Rect {
+                x: col_x[depth_index],
+                y: cy - h / 2.0,
+                w,
+                h,
+            };
+            prev_bottom = boxes[index].y + h;
+        }
+    }
+
+    let mut outgoing: Vec<Vec<usize>> = vec![Vec::new(); count];
+    for edge in &chart.edges {
+        if back.contains(&(edge.from, edge.to)) {
+            continue;
+        }
+        outgoing[edge.from].push(edge.to);
+    }
+    // Reverse pass: a singleton column (Start, diamond, Deploy) aligns to
+    // the barycenter of its forward successors, so the decision node sits
+    // between Great!/Debug while Deploy stays on the Yes lane.
+    for depth_index in (0..rows.len()).rev() {
+        let row = &rows[depth_index];
+        if row.len() != 1 {
+            continue;
+        }
+        let index = row[0];
+        let succ_ys: Vec<f32> = outgoing[index].iter().map(|&succ| center_y[succ]).collect();
+        if succ_ys.is_empty() {
+            continue;
+        }
+        let desired = succ_ys.iter().sum::<f32>() / succ_ys.len() as f32;
+        let h = sizes[index].1;
+        center_y[index] = desired;
+        boxes[index].y = desired - h / 2.0;
+    }
+
+    let min_y = boxes
+        .iter()
+        .map(|rect| rect.y)
+        .fold(f32::INFINITY, f32::min);
+    let shift = if min_y.is_finite() { PAD - min_y } else { 0.0 };
+    for rect in boxes.iter_mut() {
+        rect.y += shift;
+    }
+    if chart.direction == FlowDir::RightLeft {
+        for rect in boxes.iter_mut() {
+            rect.x = width - rect.x - rect.w;
+        }
+    }
+    let max_bottom = boxes
+        .iter()
+        .map(|rect| rect.y + rect.h)
+        .fold(0.0f32, f32::max);
+    (width, max_bottom + PAD)
 }
 
 /// Layered layout: rank by longest path from sources, centered rows.
@@ -694,44 +814,7 @@ pub fn layout_flowchart(chart: &Flowchart) -> FlowLayout {
     ];
     let horizontal = matches!(chart.direction, FlowDir::LeftRight | FlowDir::RightLeft);
     let (width, height) = if horizontal {
-        // Ranks are columns: x grows by each column's max width so a wide
-        // diamond cannot overlap the next rank (swapping x/y of a TD layout
-        // would keep the diamond's width on the rank axis).
-        let col_ws: Vec<f32> = rows
-            .iter()
-            .map(|row| row.iter().map(|&i| sizes[i].0).fold(0.0f32, f32::max))
-            .collect();
-        let col_hs: Vec<f32> = rows
-            .iter()
-            .map(|row| {
-                row.iter().map(|&i| sizes[i].1).sum::<f32>()
-                    + GAP_Y * 0.6 * row.len().saturating_sub(1) as f32
-            })
-            .collect();
-        let total_h = col_hs.iter().copied().fold(NODE_H, f32::max);
-        let mut x = PAD;
-        for (depth_index, row) in rows.iter().enumerate() {
-            let col_w = col_ws[depth_index];
-            let mut y = PAD + (total_h - col_hs[depth_index]) / 2.0;
-            for &index in row {
-                let (w, h) = sizes[index];
-                boxes[index] = Rect {
-                    x: x + (col_w - w) / 2.0,
-                    y,
-                    w,
-                    h,
-                };
-                y += h + GAP_Y * 0.6;
-            }
-            x += col_w + GAP_X;
-        }
-        if chart.direction == FlowDir::RightLeft {
-            let width = x + PAD - GAP_X;
-            for rect in &mut boxes {
-                rect.x = width - rect.x - rect.w;
-            }
-        }
-        (x + PAD - GAP_X, total_h + PAD * 2.0)
+        layout_flow_columns(chart, &rows, &sizes, &mut boxes)
     } else {
         let row_width = |row: &[usize]| {
             row.iter().map(|&i| sizes[i].0).sum::<f32>()
@@ -778,6 +861,12 @@ pub fn layout_flowchart(chart: &Flowchart) -> FlowLayout {
         .iter()
         .map(|edge| layout_edge(&layout.boxes[edge.from], &layout.boxes[edge.to], edge))
         .collect();
+    for edge in &layout.edges {
+        for &(px, py) in &edge.points {
+            layout.width = layout.width.max(px + PAD);
+            layout.height = layout.height.max(py + PAD);
+        }
+    }
     layout
 }
 
@@ -809,29 +898,45 @@ fn layout_edge(from: &Rect, to: &Rect, edge: &FEdge) -> EdgeGeom {
     let (tcx, tcy) = center(to);
     let start = border_point(from, tcx, tcy);
     let end = border_point(to, fcx, fcy);
-    let dx = end.0 - start.0;
-    let dy = end.1 - start.1;
-    let mut points = vec![start];
-    if dx != 0.0 && dy != 0.0 {
-        // One Manhattan bend along the dominant axis.
-        if dy.abs() >= dx.abs() {
-            points.push((start.0, end.1));
-        } else {
-            points.push((end.0, start.1));
-        }
-    }
-    points.push(end);
-    let bend = points[points.len() / 2];
+    let points = vec![start, end];
+    let label_at = offset_label(polyline_label_at(&points), start, end);
     let (tip, tip_dir) = arrow_tip(&points);
     EdgeGeom {
         points,
         tip,
         tip_dir,
         label: edge.label.clone(),
-        label_at: bend,
+        label_at,
         dashed: edge.dashed,
         thick: edge.thick,
         arrow: edge.arrow,
+    }
+}
+
+fn offset_label(at: (f32, f32), start: (f32, f32), end: (f32, f32)) -> (f32, f32) {
+    let dx = end.0 - start.0;
+    let dy = end.1 - start.1;
+    let len = (dx * dx + dy * dy).sqrt().max(1.0);
+    let mut nx = -dy / len;
+    let mut ny = dx / len;
+    if ny > 0.0 {
+        nx = -nx;
+        ny = -ny;
+    }
+    (at.0 + nx * 14.0, at.1 + ny * 14.0)
+}
+
+fn polyline_label_at(points: &[(f32, f32)]) -> (f32, f32) {
+    if points.len() < 2 {
+        return points.first().copied().unwrap_or((0.0, 0.0));
+    }
+    if points.len() == 2 {
+        (
+            points[0].0 * 0.62 + points[1].0 * 0.38,
+            points[0].1 * 0.62 + points[1].1 * 0.38,
+        )
+    } else {
+        points[points.len() / 2]
     }
 }
 
@@ -1124,6 +1229,28 @@ mod tests {
         assert!((layout.boxes[2].x - layout.boxes[3].x).abs() < 40.0);
         assert!(layout.boxes[4].x > layout.boxes[2].x);
         assert!(layout.boxes[2].y < layout.boxes[3].y);
+        let cy = |i: usize| layout.boxes[i].y + layout.boxes[i].h / 2.0;
+        // Start and the diamond sit on the mid-lane between Great! and Debug;
+        // Deploy stays on the Yes/Great! lane.
+        assert!(
+            (cy(0) - cy(1)).abs() < 2.0,
+            "Start/diamond centers: {} vs {}",
+            cy(0),
+            cy(1)
+        );
+        assert!(
+            (cy(2) - cy(4)).abs() < 2.0,
+            "Great/Deploy centers: {} vs {}",
+            cy(2),
+            cy(4)
+        );
+        assert!(
+            cy(2) < cy(1) && cy(1) < cy(3),
+            "diamond should sit between Great and Debug: G={} Dmd={} Dbg={}",
+            cy(2),
+            cy(1),
+            cy(3)
+        );
         assert!(
             layout.width < 900.0,
             "cycle inflated width: {}",

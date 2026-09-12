@@ -265,11 +265,16 @@ pub struct Vim {
     pub message: String,
 }
 
-/// What a key did: re-render, ignore, or yank text to the clipboard.
+/// What a key did: re-render, ignore, yank text, or scroll the viewport.
 pub enum Outcome {
     Changed,
     Ignored,
     Yanked(String),
+    /// Scroll the document by this many steps (positive = down), like webpage
+    /// arrow keys. The viewer maps a step to a pixel delta.
+    Scroll(isize),
+    /// Scroll by half the viewport, this many times (positive = down).
+    ScrollHalf(isize),
 }
 
 impl Vim {
@@ -305,7 +310,9 @@ impl Vim {
     pub fn handle_key(&mut self, lines: &[Line], key: Key, half: usize) -> Outcome {
         match self.mode.clone() {
             Mode::Search { .. } => self.search_key(lines, key),
-            Mode::Visual { anchor, linewise } => self.visual_key(lines, key, anchor, linewise),
+            Mode::Visual { anchor, linewise } => {
+                self.visual_key(lines, key, anchor, linewise, half)
+            }
             Mode::Normal => self.normal_key(lines, key, half),
         }
     }
@@ -326,7 +333,33 @@ impl Vim {
         self.want_col = self.cursor.col;
     }
 
-    fn normal_key(&mut self, lines: &[Line], key: Key, half: usize) -> Outcome {
+    /// Inclusive line range covered by the current visual selection, if any.
+    /// Both character-wise (`v`) and line-wise (`V`) highlight whole items
+    /// (rows); yank still uses character vs line extents.
+    pub fn selection_lines(&self) -> Option<(usize, usize)> {
+        match &self.mode {
+            Mode::Visual { anchor, .. } => {
+                let (start, end) = ordered(*anchor, self.cursor);
+                Some((start.line, end.line))
+            }
+            _ => None,
+        }
+    }
+
+    /// Place the cursor on a line (column 0). Used when visual mode starts
+    /// on a scrolled viewport whose cursor would otherwise be off-screen.
+    pub fn place_cursor(&mut self, lines: &[Line], line: usize) {
+        if lines.is_empty() {
+            self.cursor = Pos { line: 0, col: 0 };
+            self.want_col = 0;
+            return;
+        }
+        self.cursor.line = line.min(lines.len() - 1);
+        self.cursor.col = 0;
+        self.want_col = 0;
+    }
+
+    fn normal_key(&mut self, lines: &[Line], key: Key, _half: usize) -> Outcome {
         match key {
             Key::Esc => {
                 let had = self.count.is_some()
@@ -366,8 +399,8 @@ impl Vim {
                 let was_y = std::mem::replace(&mut self.pending_y, false);
                 let was_g = std::mem::replace(&mut self.pending_g, false);
                 match key {
-                    Key::Char('j') | Key::Down => self.move_by(lines, repeat as isize),
-                    Key::Char('k') | Key::Up => self.move_by(lines, -(repeat as isize)),
+                    Key::Char('j') | Key::Down => Outcome::Scroll(repeat as isize),
+                    Key::Char('k') | Key::Up => Outcome::Scroll(-(repeat as isize)),
                     Key::Char('g') => {
                         // Second `g` goes to the top; `gg` arrives as two keys.
                         if was_g {
@@ -390,8 +423,8 @@ impl Vim {
                         }
                         Outcome::Changed
                     }
-                    Key::Ctrl('d') => self.move_by(lines, (half * repeat) as isize),
-                    Key::Ctrl('u') => self.move_by(lines, -((half * repeat) as isize)),
+                    Key::Ctrl('d') => Outcome::ScrollHalf(repeat as isize),
+                    Key::Ctrl('u') => Outcome::ScrollHalf(-(repeat as isize)),
                     Key::Char('v') => {
                         if lines.is_empty() {
                             return Outcome::Ignored;
@@ -446,7 +479,14 @@ impl Vim {
         }
     }
 
-    fn visual_key(&mut self, lines: &[Line], key: Key, anchor: Pos, linewise: bool) -> Outcome {
+    fn visual_key(
+        &mut self,
+        lines: &[Line],
+        key: Key,
+        anchor: Pos,
+        linewise: bool,
+        half: usize,
+    ) -> Outcome {
         match key {
             Key::Esc => {
                 self.mode = Mode::Normal;
@@ -463,6 +503,22 @@ impl Vim {
                     linewise: !linewise,
                 };
                 Outcome::Changed
+            }
+            Key::Char('j') | Key::Down => {
+                let repeat = self.count.take().unwrap_or(1);
+                self.move_by(lines, repeat as isize)
+            }
+            Key::Char('k') | Key::Up => {
+                let repeat = self.count.take().unwrap_or(1);
+                self.move_by(lines, -(repeat as isize))
+            }
+            Key::Ctrl('d') => {
+                let repeat = self.count.take().unwrap_or(1);
+                self.move_by(lines, (half * repeat) as isize)
+            }
+            Key::Ctrl('u') => {
+                let repeat = self.count.take().unwrap_or(1);
+                self.move_by(lines, -((half * repeat) as isize))
             }
             Key::Char('y') => {
                 let (start, end) = ordered(anchor, self.cursor);
@@ -692,19 +748,43 @@ mod tests {
     }
 
     #[test]
-    fn jk_move_and_clamp_with_count() {
+    fn jk_scroll_in_normal_and_move_in_visual() {
         let lines = doc_lines("# a\n\n# b\n\n# c\n");
         let mut vim = Vim::new();
         press(&mut vim, &lines, Key::Char('3'));
-        press(&mut vim, &lines, Key::Char('j'));
-        assert_eq!(vim.cursor.line, 2);
         assert!(matches!(
             press(&mut vim, &lines, Key::Char('j')),
-            Outcome::Ignored
+            Outcome::Scroll(3)
         ));
+        assert_eq!(vim.cursor.line, 0);
+        assert!(matches!(
+            press(&mut vim, &lines, Key::Char('k')),
+            Outcome::Scroll(-1)
+        ));
+        press(&mut vim, &lines, Key::Char('V'));
+        press(&mut vim, &lines, Key::Char('3'));
+        press(&mut vim, &lines, Key::Char('j'));
+        assert_eq!(vim.cursor.line, 2);
         press(&mut vim, &lines, Key::Char('2'));
         press(&mut vim, &lines, Key::Char('k'));
         assert_eq!(vim.cursor.line, 0);
+    }
+
+    #[test]
+    fn visual_selection_covers_items_until_yank() {
+        let lines = doc_lines("# a\n\n# b\n\n# c\n");
+        let mut vim = Vim::new();
+        assert_eq!(vim.selection_lines(), None);
+        press(&mut vim, &lines, Key::Char('v'));
+        assert_eq!(vim.selection_lines(), Some((0, 0)));
+        press(&mut vim, &lines, Key::Char('j'));
+        assert_eq!(vim.selection_lines(), Some((0, 1)));
+        let Outcome::Yanked(text) = press(&mut vim, &lines, Key::Char('y')) else {
+            panic!("expected yank");
+        };
+        assert_eq!(text, "a\n");
+        assert_eq!(vim.selection_lines(), None);
+        assert_eq!(vim.mode, Mode::Normal);
     }
 
     #[test]
@@ -726,12 +806,13 @@ mod tests {
     fn stray_g_does_not_latch() {
         let lines = doc_lines("# a\n\n# b\n\n# c\n");
         let mut vim = Vim::new();
+        press(&mut vim, &lines, Key::Char('G'));
+        assert_eq!(vim.cursor.line, 2);
         press(&mut vim, &lines, Key::Char('g'));
+        // `j` is a viewport scroll in normal mode and must clear a pending `g`.
         press(&mut vim, &lines, Key::Char('j'));
-        assert_eq!(vim.cursor.line, 1);
-        // The earlier lone `g` was cleared by `j`: this `g` only arms.
         press(&mut vim, &lines, Key::Char('g'));
-        assert_eq!(vim.cursor.line, 1);
+        assert_eq!(vim.cursor.line, 2);
         press(&mut vim, &lines, Key::Char('g'));
         assert_eq!(vim.cursor.line, 0);
     }
@@ -747,9 +828,19 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_d_u_scroll_by_half_page() {
+    fn ctrl_d_u_scroll_viewport_in_normal() {
         let lines = doc_lines("# 1\n\n# 2\n\n# 3\n\n# 4\n\n# 5\n");
         let mut vim = Vim::new();
+        assert!(matches!(
+            vim.handle_key(&lines, Key::Ctrl('d'), 2),
+            Outcome::ScrollHalf(1)
+        ));
+        assert_eq!(vim.cursor.line, 0);
+        assert!(matches!(
+            vim.handle_key(&lines, Key::Ctrl('u'), 2),
+            Outcome::ScrollHalf(-1)
+        ));
+        press(&mut vim, &lines, Key::Char('V'));
         vim.handle_key(&lines, Key::Ctrl('d'), 2);
         assert_eq!(vim.cursor.line, 2);
         vim.handle_key(&lines, Key::Ctrl('u'), 2);
@@ -793,10 +884,21 @@ mod tests {
             panic!("expected yank");
         };
         assert_eq!(text, "b");
-        // A stray `y` arms nothing permanent: next motion clears it.
+        // A stray `y` arms nothing permanent: viewport scroll clears it.
         press(&mut vim, &lines, Key::Char('y'));
-        press(&mut vim, &lines, Key::Char('k'));
-        assert_eq!(vim.cursor.line, 0);
+        assert!(matches!(
+            press(&mut vim, &lines, Key::Char('k')),
+            Outcome::Scroll(-1)
+        ));
+        assert_eq!(vim.cursor.line, 1);
+        assert!(matches!(
+            press(&mut vim, &lines, Key::Char('y')),
+            Outcome::Changed
+        ));
+        let Outcome::Yanked(again) = press(&mut vim, &lines, Key::Char('y')) else {
+            panic!("expected yank after scroll cleared pending y");
+        };
+        assert_eq!(again, "b");
     }
 
     #[test]
@@ -857,7 +959,7 @@ mod tests {
         let mut vim = Vim::new();
         assert!(matches!(
             press(&mut vim, &lines, Key::Char('j')),
-            Outcome::Ignored
+            Outcome::Scroll(1)
         ));
         assert!(matches!(
             press(&mut vim, &lines, Key::Char('v')),
