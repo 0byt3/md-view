@@ -28,9 +28,12 @@ use std::time::Duration;
 const DEBOUNCE: Duration = Duration::from_millis(250);
 /// How often the UI task drains the watch channel.
 const POLL: Duration = Duration::from_millis(100);
+/// Pixel delta for one normal-mode `j`/`k` (or arrow key), matching typical
+/// webpage arrow-key scrolling.
+const LINE_SCROLL_PX: f32 = 40.0;
 /// Ctrl-d/u stride used only before the scrollable view has painted once
 /// (so `ScrollHandle` cannot yet report a visible row count).
-const HALF_PAGE_FALLBACK: usize = 20;
+const HALF_PAGE_FALLBACK_PX: f32 = 240.0;
 /// Indent added per nested list level, in pixels.
 const LIST_INDENT: f32 = 16.0;
 /// Indent added per nested blockquote level, in pixels.
@@ -64,9 +67,12 @@ struct Viewer {
     missing: bool,
     rx: std::sync::mpsc::Receiver<watch::WatchEvent>,
     _watch: Option<watch::FileWatch>,
-    /// Tracks the scroll offset of the document body so the cursor row can
-    /// be kept in view and `Ctrl-d/u` can measure the real viewport.
+    /// Tracks the scroll offset of the document body so cursor-moving
+    /// commands (`gg`/`G`/`/`/visual motions) can keep the target in view.
     scroll: ScrollHandle,
+    /// When true, the next paint scrolls the cursor's row into view. Pixel
+    /// `j`/`k` scrolling leaves this false so it does not fight the offset.
+    follow_cursor: bool,
 }
 
 /// Map a platform keystroke to a vim key. Anything with modifiers other
@@ -94,9 +100,25 @@ fn map_keystroke(stroke: &Keystroke) -> Option<vim::Key> {
         "up" => Some(vim::Key::Up),
         "down" => Some(vim::Key::Down),
         " " | "space" => Some(vim::Key::Char(' ')),
-        key if key.chars().count() == 1 => key.chars().next().map(vim::Key::Char),
-        _ => None,
+        _ => typed_char(stroke).map(vim::Key::Char),
     }
+}
+
+/// Prefer the typed character so Shift+v becomes `V` (visual line).
+fn typed_char(stroke: &Keystroke) -> Option<char> {
+    if let Some(ch) = stroke.key_char.as_deref() {
+        if ch.chars().count() == 1 {
+            return ch.chars().next();
+        }
+    }
+    if stroke.key.chars().count() == 1 {
+        let mut ch = stroke.key.chars().next()?;
+        if stroke.modifiers.shift {
+            ch = ch.to_ascii_uppercase();
+        }
+        return Some(ch);
+    }
+    None
 }
 
 impl Viewer {
@@ -116,6 +138,7 @@ impl Viewer {
                     self.diagrams = diagram_cache(&self.doc);
                     self.vim.rebase(old_key, &self.lines);
                     self.missing = false;
+                    self.follow_cursor = true;
                     changed = true;
                 }
                 watch::WatchEvent::Gone => {
@@ -143,17 +166,86 @@ impl Viewer {
         }
     }
 
-    /// Ctrl-d/u stride: half of the rows currently visible in the scroll
-    /// view, or [`HALF_PAGE_FALLBACK`] before the first paint has happened.
+    /// Ctrl-d/u stride in visual mode: half of the rows currently visible,
+    /// or a fallback before the first paint has happened.
     fn half_page(&self) -> usize {
         let top = self.scroll.top_item();
         let bottom = self.scroll.bottom_item();
         let visible = bottom.saturating_sub(top);
         if visible == 0 {
-            HALF_PAGE_FALLBACK
+            20
         } else {
             (visible / 2).max(1)
         }
+    }
+
+    /// Pixel stride for normal-mode Ctrl-d/u: half the scroll viewport.
+    fn half_page_px(&self) -> f32 {
+        let height: f32 = self.scroll.bounds().size.height.into();
+        if height <= 1.0 {
+            HALF_PAGE_FALLBACK_PX
+        } else {
+            (height / 2.0).max(LINE_SCROLL_PX)
+        }
+    }
+
+    fn scroll_by_pixels(&self, dy: f32) {
+        let mut offset = self.scroll.offset();
+        let max = self.scroll.max_offset();
+        offset.y = (offset.y - px(dy)).clamp(-max.y, px(0.));
+        offset.x = offset.x.clamp(-max.x, px(0.));
+        self.scroll.set_offset(offset);
+    }
+
+    /// First navigable line that paints as scroll child `row`.
+    fn line_index_for_row(&self, row: usize) -> usize {
+        let mut current_row = 0usize;
+        let mut last_diagram: Option<usize> = None;
+        for (index, line) in self.lines.iter().enumerate() {
+            if self.diagrams.contains_key(&line.block) {
+                if last_diagram == Some(line.block) {
+                    continue;
+                }
+                last_diagram = Some(line.block);
+            } else {
+                last_diagram = None;
+            }
+            if current_row == row {
+                return index;
+            }
+            current_row += 1;
+        }
+        self.lines.len().saturating_sub(1)
+    }
+
+    fn snap_cursor_if_offscreen(&mut self) {
+        if self.lines.is_empty() {
+            return;
+        }
+        let top = self.line_index_for_row(self.scroll.top_item());
+        let bottom = self.line_index_for_row(self.scroll.bottom_item());
+        if self.vim.cursor.line < top || self.vim.cursor.line > bottom {
+            self.vim.place_cursor(&self.lines, top);
+        }
+    }
+
+    fn line_selected(&self, index: usize) -> bool {
+        self.vim
+            .selection_lines()
+            .is_some_and(|(start, end)| index >= start && index <= end)
+    }
+
+    fn block_selected(&self, block: usize) -> bool {
+        let Some((start, end)) = self.vim.selection_lines() else {
+            return false;
+        };
+        let last = end.min(self.lines.len().saturating_sub(1));
+        if start > last {
+            return false;
+        }
+        self.lines[start..=last]
+            .iter()
+            .any(|line| line.block == block)
     }
 }
 
@@ -809,7 +901,7 @@ impl Viewer {
             vim::RowContent::Rule => self.render_rule(),
         };
         let content = wrap_quote(line.quote_depth, content);
-        if index == self.vim.cursor.line {
+        if self.line_selected(index) {
             div()
                 .bg(rgb(theme::BG_SELECTION))
                 .child(content)
@@ -947,11 +1039,7 @@ impl Render for Viewer {
                 }
                 diagram_block = Some(line.block);
                 diagram_row_ix = rows.len();
-                let selected = self
-                    .lines
-                    .get(self.vim.cursor.line)
-                    .map(|cursor| cursor.block)
-                    == Some(line.block);
+                let selected = self.block_selected(line.block);
                 rows.push(self.render_diagram(line.block, selected));
                 row_for_line.push(diagram_row_ix);
             } else {
@@ -960,10 +1048,13 @@ impl Render for Viewer {
                 rows.push(self.render_line(index, line));
             }
         }
-        // Keep the cursor's row scrolled into view on every render (motion,
-        // yank, or a file reload all end up here via `cx.notify()`).
-        if let Some(&row_ix) = row_for_line.get(self.vim.cursor.line) {
-            self.scroll.scroll_to_item(row_ix);
+        // Cursor-moving commands ask to keep the target row in view. Normal
+        // `j`/`k` pixel-scroll instead and must not snap back to a cursor line.
+        if self.follow_cursor {
+            if let Some(&row_ix) = row_for_line.get(self.vim.cursor.line) {
+                self.scroll.scroll_to_item(row_ix);
+            }
+            self.follow_cursor = false;
         }
 
         let doc_body = div()
@@ -1043,6 +1134,7 @@ fn main() {
             rx,
             _watch: watcher,
             scroll: ScrollHandle::new(),
+            follow_cursor: false,
         });
         let window = cx
             .open_window(
@@ -1059,12 +1151,28 @@ fn main() {
         cx.observe_keystrokes(move |event, _, cx| {
             view.update(cx, |view, cx| {
                 if let Some(key) = map_keystroke(&event.keystroke) {
+                    if matches!(view.vim.mode, vim::Mode::Normal)
+                        && matches!(key, vim::Key::Char('v') | vim::Key::Char('V'))
+                    {
+                        view.snap_cursor_if_offscreen();
+                    }
                     let half = view.half_page();
                     match view.vim.handle_key(&view.lines, key, half) {
-                        vim::Outcome::Changed => cx.notify(),
+                        vim::Outcome::Changed => {
+                            view.follow_cursor = true;
+                            cx.notify();
+                        }
                         vim::Outcome::Ignored => {}
                         vim::Outcome::Yanked(text) => {
                             cx.write_to_clipboard(ClipboardItem::new_string(text));
+                            cx.notify();
+                        }
+                        vim::Outcome::Scroll(steps) => {
+                            view.scroll_by_pixels(LINE_SCROLL_PX * steps as f32);
+                            cx.notify();
+                        }
+                        vim::Outcome::ScrollHalf(times) => {
+                            view.scroll_by_pixels(view.half_page_px() * times as f32);
                             cx.notify();
                         }
                     }
