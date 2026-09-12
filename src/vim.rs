@@ -267,8 +267,8 @@ pub const HELP_SECTIONS: &[HelpSection] = &[
     HelpSection {
         title: "Scroll",
         rows: &[
-            ("j  /  ↓", "Scroll down"),
-            ("k  /  ↑", "Scroll up"),
+            ("j  /  Down", "Scroll down"),
+            ("k  /  Up", "Scroll up"),
             ("Ctrl-d", "Half page down"),
             ("Ctrl-u", "Half page up"),
             ("gg", "Jump to the top"),

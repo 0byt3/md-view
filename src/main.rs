@@ -1049,7 +1049,7 @@ impl Viewer {
             .gap_1()
             .child(
                 div()
-                    .px_1()
+                    .px_1p5()
                     .border_1()
                     .border_color(rgb(theme::BORDER))
                     .rounded_md()
@@ -1062,7 +1062,7 @@ impl Viewer {
     }
 
     fn render_help(&self) -> AnyElement {
-        let mut body = div().flex().flex_col().gap_3().p_4();
+        let mut body = div().flex().flex_col().gap_2().p_4();
         body = body.child(
             div()
                 .flex()
@@ -1077,39 +1077,16 @@ impl Viewer {
                         .child("Esc / q / ? close"),
                 ),
         );
-        for section in vim::HELP_SECTIONS {
-            let mut block = div().flex().flex_col().gap_1();
-            block = block.child(
-                div()
-                    .text_sm()
-                    .text_color(rgb(theme::LINK))
-                    .child(section.title),
-            );
-            for (keys, desc) in section.rows {
-                block = block.child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .justify_between()
-                        .gap_4()
-                        .child(
-                            div()
-                                .font_family("DejaVu Sans Mono")
-                                .text_sm()
-                                .text_color(rgb(theme::BODY))
-                                .child(*keys),
-                        )
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(rgb(theme::FG_GUTTER))
-                                .child(*desc),
-                        ),
-                );
+        let mut columns = div().flex().flex_row().items_start().gap_6();
+        let mid = vim::HELP_SECTIONS.len().div_ceil(2);
+        for group in [&vim::HELP_SECTIONS[..mid], &vim::HELP_SECTIONS[mid..]] {
+            let mut col = div().flex().flex_col().gap_3().flex_1();
+            for section in group {
+                col = col.child(self.render_help_section(section));
             }
-            body = body.child(block);
+            columns = columns.child(col);
         }
+        body = body.child(columns);
         div()
             .absolute()
             .top_0()
@@ -1119,14 +1096,13 @@ impl Viewer {
             .flex()
             .justify_center()
             .items_start()
-            .pt_4()
+            .p_4()
             .occlude()
             .bg(rgb(theme::PAGE_BG))
             .child(
                 div()
                     .id("help")
-                    .w(px(520.))
-                    .max_h(px(560.))
+                    .w(px(720.))
                     .overflow_y_scroll()
                     .border_1()
                     .border_color(rgb(theme::BORDER))
@@ -1135,6 +1111,40 @@ impl Viewer {
                     .child(body),
             )
             .into_any_element()
+    }
+
+    fn render_help_section(&self, section: &vim::HelpSection) -> AnyElement {
+        let mut block = div().flex().flex_col().gap_1();
+        block = block.child(
+            div()
+                .text_sm()
+                .text_color(rgb(theme::LINK))
+                .child(section.title),
+        );
+        for (keys, desc) in section.rows {
+            block = block.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .child(
+                        div()
+                            .font_family("DejaVu Sans Mono")
+                            .text_sm()
+                            .text_color(rgb(theme::BODY))
+                            .child(*keys),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(theme::FG_GUTTER))
+                            .child(*desc),
+                    ),
+            );
+        }
+        block.into_any_element()
     }
 }
 
