@@ -237,8 +237,12 @@ pub struct Pos {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Key {
     Char(char),
+    Left,
+    Right,
     Up,
     Down,
+    PageUp,
+    PageDown,
     Esc,
     Enter,
     Backspace,
@@ -249,8 +253,15 @@ pub enum Key {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
     Normal,
+    Cursor,
     Visual { anchor: Pos, linewise: bool },
-    Search { query: String },
+    Search { query: String, from_cursor: bool },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Highlight {
+    Chars(usize, usize),
+    Whole,
 }
 
 /// Vim navigation state.
@@ -275,6 +286,7 @@ pub enum Outcome {
     Scroll(isize),
     /// Scroll by half the viewport, this many times (positive = down).
     ScrollHalf(isize),
+    ScrollPage(isize),
 }
 
 impl Vim {
@@ -295,9 +307,10 @@ impl Vim {
     pub fn status(&self) -> String {
         let mode = match &self.mode {
             Mode::Normal => "-- NORMAL --",
+            Mode::Cursor => "-- CURSOR --",
             Mode::Visual { linewise, .. } if *linewise => "-- VISUAL LINE --",
             Mode::Visual { .. } => "-- VISUAL --",
-            Mode::Search { query } => return format!("/{query}"),
+            Mode::Search { query, .. } => return format!("/{query}"),
         };
         match self.count {
             Some(n) => format!("{n}{mode}"),
@@ -313,6 +326,7 @@ impl Vim {
             Mode::Visual { anchor, linewise } => {
                 self.visual_key(lines, key, anchor, linewise, half)
             }
+            Mode::Cursor => self.cursor_key(lines, key, half),
             Mode::Normal => self.normal_key(lines, key, half),
         }
     }
@@ -341,6 +355,40 @@ impl Vim {
             Mode::Visual { anchor, .. } => {
                 let (start, end) = ordered(*anchor, self.cursor);
                 Some((start.line, end.line))
+            }
+            _ => None,
+        }
+    }
+
+    pub fn highlight_for_line(&self, line: usize, char_count: usize) -> Option<Highlight> {
+        match &self.mode {
+            Mode::Cursor if self.cursor.line == line => {
+                if char_count == 0 {
+                    Some(Highlight::Whole)
+                } else {
+                    let start = self.cursor.col.min(char_count - 1);
+                    Some(Highlight::Chars(start, start + 1))
+                }
+            }
+            Mode::Visual { anchor, linewise } => {
+                let (start, end) = ordered(*anchor, self.cursor);
+                if line < start.line || line > end.line {
+                    return None;
+                }
+                if *linewise || char_count == 0 {
+                    return Some(Highlight::Whole);
+                }
+                let from = if line == start.line {
+                    start.col.min(char_count - 1)
+                } else {
+                    0
+                };
+                let to = if line == end.line {
+                    end.col.min(char_count - 1) + 1
+                } else {
+                    char_count
+                };
+                Some(Highlight::Chars(from, to))
             }
             _ => None,
         }
@@ -425,6 +473,16 @@ impl Vim {
                     }
                     Key::Ctrl('d') => Outcome::ScrollHalf(repeat as isize),
                     Key::Ctrl('u') => Outcome::ScrollHalf(-(repeat as isize)),
+                    Key::PageDown => Outcome::ScrollPage(repeat as isize),
+                    Key::PageUp => Outcome::ScrollPage(-(repeat as isize)),
+                    Key::Char('i') => {
+                        if lines.is_empty() {
+                            return Outcome::Ignored;
+                        }
+                        self.message.clear();
+                        self.mode = Mode::Cursor;
+                        Outcome::Changed
+                    }
                     Key::Char('v') => {
                         if lines.is_empty() {
                             return Outcome::Ignored;
@@ -454,7 +512,112 @@ impl Vim {
                         self.pending_g = false;
                         self.mode = Mode::Search {
                             query: String::new(),
+                            from_cursor: false,
                         };
+                        Outcome::Changed
+                    }
+                    Key::Char('n') => self.jump_search(lines, true),
+                    Key::Char('N') => self.jump_search(lines, false),
+                    Key::Char('y') => {
+                        if was_y {
+                            self.yank_current_line(lines)
+                        } else if lines.is_empty() {
+                            self.message = "nothing to yank".to_string();
+                            Outcome::Changed
+                        } else {
+                            self.pending_y = true;
+                            Outcome::Changed
+                        }
+                    }
+                    _ => {
+                        self.message.clear();
+                        Outcome::Ignored
+                    }
+                }
+            }
+        }
+    }
+
+    fn cursor_key(&mut self, lines: &[Line], key: Key, half: usize) -> Outcome {
+        match key {
+            Key::Esc => {
+                self.mode = Mode::Normal;
+                self.count = None;
+                self.pending_g = false;
+                self.pending_y = false;
+                self.message.clear();
+                Outcome::Changed
+            }
+            Key::Char(c) if c.is_ascii_digit() && !(c == '0' && self.count.is_none()) => {
+                let digit = (c as u8 - b'0') as usize;
+                self.count = Some(
+                    self.count
+                        .unwrap_or(0)
+                        .saturating_mul(10)
+                        .saturating_add(digit),
+                );
+                self.pending_g = false;
+                self.pending_y = false;
+                Outcome::Changed
+            }
+            _ => {
+                let repeat = self.count.take().unwrap_or(1);
+                let was_g = std::mem::replace(&mut self.pending_g, false);
+                let was_y = std::mem::replace(&mut self.pending_y, false);
+                match key {
+                    Key::Char('h') | Key::Left => self.move_horizontal(lines, -(repeat as isize)),
+                    Key::Char('l') | Key::Right => self.move_horizontal(lines, repeat as isize),
+                    Key::Char('j') | Key::Down => self.move_by(lines, repeat as isize),
+                    Key::Char('k') | Key::Up => self.move_by(lines, -(repeat as isize)),
+                    Key::Ctrl('d') => self.move_by(lines, (half * repeat) as isize),
+                    Key::Ctrl('u') => self.move_by(lines, -((half * repeat) as isize)),
+                    Key::PageDown => self.move_by(lines, (half * 2 * repeat) as isize),
+                    Key::PageUp => self.move_by(lines, -((half * 2 * repeat) as isize)),
+                    Key::Char('0') => self.move_to_column(lines, 0),
+                    Key::Char('$') => {
+                        let col = lines
+                            .get(self.cursor.line)
+                            .map(|line| char_len(&line.text).saturating_sub(1))
+                            .unwrap_or(0);
+                        self.move_to_column(lines, col)
+                    }
+                    Key::Char('w') => self.move_word(lines, true, repeat),
+                    Key::Char('b') => self.move_word(lines, false, repeat),
+                    Key::Char('g') => {
+                        if was_g {
+                            self.goto_line(lines, repeat.saturating_sub(1));
+                        } else {
+                            self.pending_g = true;
+                            if repeat != 1 {
+                                self.count = Some(repeat);
+                            }
+                        }
+                        self.message.clear();
+                        Outcome::Changed
+                    }
+                    Key::Char('G') => {
+                        if repeat == 1 {
+                            self.goto_line(lines, lines.len().saturating_sub(1));
+                        } else {
+                            self.goto_line(lines, repeat.saturating_sub(1));
+                        }
+                        self.message.clear();
+                        Outcome::Changed
+                    }
+                    Key::Char('v') | Key::Char('V') => {
+                        self.mode = Mode::Visual {
+                            anchor: self.cursor,
+                            linewise: matches!(key, Key::Char('V')),
+                        };
+                        self.message.clear();
+                        Outcome::Changed
+                    }
+                    Key::Char('/') => {
+                        self.mode = Mode::Search {
+                            query: String::new(),
+                            from_cursor: true,
+                        };
+                        self.message.clear();
                         Outcome::Changed
                     }
                     Key::Char('n') => self.jump_search(lines, true),
@@ -489,18 +652,29 @@ impl Vim {
     ) -> Outcome {
         match key {
             Key::Esc => {
-                self.mode = Mode::Normal;
+                self.mode = Mode::Cursor;
                 self.message.clear();
                 Outcome::Changed
             }
-            Key::Char('v') if !linewise => {
-                self.mode = Mode::Normal;
+            Key::Char('v') => {
+                self.mode = if linewise {
+                    Mode::Visual {
+                        anchor,
+                        linewise: false,
+                    }
+                } else {
+                    Mode::Cursor
+                };
                 Outcome::Changed
             }
             Key::Char('V') => {
-                self.mode = Mode::Visual {
-                    anchor,
-                    linewise: !linewise,
+                self.mode = if linewise {
+                    Mode::Cursor
+                } else {
+                    Mode::Visual {
+                        anchor,
+                        linewise: true,
+                    }
                 };
                 Outcome::Changed
             }
@@ -520,6 +694,14 @@ impl Vim {
                 let repeat = self.count.take().unwrap_or(1);
                 self.move_by(lines, -((half * repeat) as isize))
             }
+            Key::PageDown => {
+                let repeat = self.count.take().unwrap_or(1);
+                self.move_by(lines, (half * 2 * repeat) as isize)
+            }
+            Key::PageUp => {
+                let repeat = self.count.take().unwrap_or(1);
+                self.move_by(lines, -((half * 2 * repeat) as isize))
+            }
             Key::Char('y') => {
                 let (start, end) = ordered(anchor, self.cursor);
                 let text = yank_range(lines, start, end, linewise);
@@ -533,13 +715,12 @@ impl Vim {
                 self.message = format!("yanked {count} {unit}{plural}");
                 self.cursor = start;
                 self.want_col = start.col;
-                self.mode = Mode::Normal;
+                self.mode = Mode::Cursor;
                 Outcome::Yanked(text)
             }
             motion => {
-                // Motions extend the selection; digits and search work too.
                 let saved = self.cursor;
-                let outcome = self.normal_key(lines, motion, 20);
+                let outcome = self.cursor_key(lines, motion, half);
                 match outcome {
                     Outcome::Changed => {
                         self.mode = Mode::Visual { anchor, linewise };
@@ -556,34 +737,53 @@ impl Vim {
     }
 
     fn search_key(&mut self, lines: &[Line], key: Key) -> Outcome {
+        let from_cursor = matches!(
+            self.mode,
+            Mode::Search {
+                from_cursor: true,
+                ..
+            }
+        );
         match key {
             Key::Esc => {
-                self.mode = Mode::Normal;
+                self.mode = if from_cursor {
+                    Mode::Cursor
+                } else {
+                    Mode::Normal
+                };
                 self.message.clear();
                 Outcome::Changed
             }
             Key::Enter => {
                 let query = match &self.mode {
-                    Mode::Search { query } if !query.is_empty() => query.clone(),
+                    Mode::Search { query, .. } if !query.is_empty() => query.clone(),
                     _ => self.last_search.clone(),
                 };
                 if query.is_empty() {
-                    self.mode = Mode::Normal;
+                    self.mode = if from_cursor {
+                        Mode::Cursor
+                    } else {
+                        Mode::Normal
+                    };
                     self.message = "no search pattern".to_string();
                     return Outcome::Changed;
                 }
                 self.last_search = query;
-                self.mode = Mode::Normal;
+                self.mode = if from_cursor {
+                    Mode::Cursor
+                } else {
+                    Mode::Normal
+                };
                 self.jump_search(lines, true)
             }
             Key::Backspace => {
-                if let Mode::Search { query } = &mut self.mode {
+                if let Mode::Search { query, .. } = &mut self.mode {
                     query.pop();
                 }
                 Outcome::Changed
             }
             Key::Char(c) => {
-                if let Mode::Search { query } = &mut self.mode {
+                if let Mode::Search { query, .. } = &mut self.mode {
                     query.push(c);
                 }
                 Outcome::Changed
@@ -601,9 +801,65 @@ impl Vim {
             return Outcome::Ignored;
         }
         self.cursor.line = next;
-        self.cursor.col = self.want_col.min(char_len(&lines[next].text));
+        self.cursor.col = self.want_col.min(max_col(&lines[next].text));
         self.message.clear();
         Outcome::Changed
+    }
+
+    fn move_horizontal(&mut self, lines: &[Line], delta: isize) -> Outcome {
+        let Some(line) = lines.get(self.cursor.line) else {
+            return Outcome::Ignored;
+        };
+        let next =
+            (self.cursor.col as isize + delta).clamp(0, max_col(&line.text) as isize) as usize;
+        if next == self.cursor.col {
+            return Outcome::Ignored;
+        }
+        self.cursor.col = next;
+        self.want_col = next;
+        self.message.clear();
+        Outcome::Changed
+    }
+
+    fn move_to_column(&mut self, lines: &[Line], col: usize) -> Outcome {
+        let Some(line) = lines.get(self.cursor.line) else {
+            return Outcome::Ignored;
+        };
+        let next = col.min(max_col(&line.text));
+        let changed = next != self.cursor.col;
+        self.cursor.col = next;
+        self.want_col = next;
+        self.message.clear();
+        if changed {
+            Outcome::Changed
+        } else {
+            Outcome::Ignored
+        }
+    }
+
+    fn move_word(&mut self, lines: &[Line], forward: bool, repeat: usize) -> Outcome {
+        if lines.is_empty() {
+            return Outcome::Ignored;
+        }
+        let original = self.cursor;
+        for _ in 0..repeat {
+            let next = if forward {
+                next_word(lines, self.cursor)
+            } else {
+                previous_word(lines, self.cursor)
+            };
+            let Some(next) = next else {
+                break;
+            };
+            self.cursor = next;
+        }
+        self.want_col = self.cursor.col;
+        self.message.clear();
+        if self.cursor == original {
+            Outcome::Ignored
+        } else {
+            Outcome::Changed
+        }
     }
 
     fn goto_line(&mut self, lines: &[Line], index: usize) {
@@ -613,7 +869,7 @@ impl Vim {
             return;
         }
         self.cursor.line = index.min(lines.len() - 1);
-        self.cursor.col = self.want_col.min(char_len(&lines[self.cursor.line].text));
+        self.cursor.col = self.want_col.min(max_col(&lines[self.cursor.line].text));
     }
 
     fn yank_current_line(&mut self, lines: &[Line]) -> Outcome {
@@ -662,7 +918,7 @@ impl Vim {
             return;
         }
         self.cursor.line = self.cursor.line.min(lines.len() - 1);
-        self.cursor.col = self.cursor.col.min(char_len(&lines[self.cursor.line].text));
+        self.cursor.col = self.cursor.col.min(max_col(&lines[self.cursor.line].text));
     }
 }
 
@@ -678,6 +934,60 @@ fn char_len(text: &str) -> usize {
     text.chars().count()
 }
 
+fn max_col(text: &str) -> usize {
+    char_len(text).saturating_sub(1)
+}
+
+fn word_starts(text: &str) -> Vec<usize> {
+    let chars: Vec<char> = text.chars().collect();
+    chars
+        .iter()
+        .enumerate()
+        .filter_map(|(index, ch)| {
+            let previous_is_word = index
+                .checked_sub(1)
+                .and_then(|previous| chars.get(previous))
+                .is_some_and(|previous| previous.is_alphanumeric() || *previous == '_');
+            if (ch.is_alphanumeric() || *ch == '_') && !previous_is_word {
+                Some(index)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn next_word(lines: &[Line], from: Pos) -> Option<Pos> {
+    for (line_index, line) in lines.iter().enumerate().skip(from.line) {
+        if let Some(col) = word_starts(&line.text)
+            .into_iter()
+            .find(|col| line_index > from.line || *col > from.col)
+        {
+            return Some(Pos {
+                line: line_index,
+                col,
+            });
+        }
+    }
+    None
+}
+
+fn previous_word(lines: &[Line], from: Pos) -> Option<Pos> {
+    for line_index in (0..=from.line.min(lines.len().saturating_sub(1))).rev() {
+        if let Some(col) = word_starts(&lines[line_index].text)
+            .into_iter()
+            .rev()
+            .find(|col| line_index < from.line || *col < from.col)
+        {
+            return Some(Pos {
+                line: line_index,
+                col,
+            });
+        }
+    }
+    None
+}
+
 fn char_slice(text: &str, from: usize, to: usize) -> String {
     text.chars()
         .skip(from)
@@ -685,7 +995,6 @@ fn char_slice(text: &str, from: usize, to: usize) -> String {
         .collect()
 }
 
-/// Yank text for a normalized [start, end) range (end-exclusive).
 fn yank_range(lines: &[Line], start: Pos, end: Pos, linewise: bool) -> String {
     if lines.is_empty() || start.line >= lines.len() {
         return String::new();
@@ -707,7 +1016,11 @@ fn yank_range(lines: &[Line], start: Pos, end: Pos, linewise: bool) -> String {
         } else {
             0
         };
-        let to = if i == last { end.col.min(len) } else { len };
+        let to = if i == last {
+            end.col.saturating_add(1).min(len)
+        } else {
+            len
+        };
         out.push(char_slice(&line.text, from, to));
     }
     out.join("\n")
@@ -771,6 +1084,66 @@ mod tests {
     }
 
     #[test]
+    fn cursor_mode_uses_character_and_word_motions() {
+        let lines = doc_lines("one two\n\nthree\n");
+        let mut vim = Vim::new();
+        assert!(matches!(
+            press(&mut vim, &lines, Key::Char('i')),
+            Outcome::Changed
+        ));
+        assert_eq!(vim.mode, Mode::Cursor);
+        assert_eq!(
+            vim.highlight_for_line(0, lines[0].text.chars().count()),
+            Some(Highlight::Chars(0, 1))
+        );
+        press(&mut vim, &lines, Key::Char('w'));
+        assert_eq!(vim.cursor, Pos { line: 0, col: 4 });
+        press(&mut vim, &lines, Key::Char('l'));
+        assert_eq!(vim.cursor, Pos { line: 0, col: 5 });
+        press(&mut vim, &lines, Key::Char('b'));
+        assert_eq!(vim.cursor, Pos { line: 0, col: 4 });
+        press(&mut vim, &lines, Key::Char('$'));
+        assert_eq!(vim.cursor, Pos { line: 0, col: 6 });
+        press(&mut vim, &lines, Key::Char('j'));
+        assert_eq!(vim.cursor, Pos { line: 1, col: 4 });
+        press(&mut vim, &lines, Key::Char('0'));
+        assert_eq!(vim.cursor.col, 0);
+    }
+
+    #[test]
+    fn page_keys_scroll_normally_and_move_cursor_and_selection() {
+        let lines = doc_lines("# 1\n\n# 2\n\n# 3\n\n# 4\n\n# 5\n");
+        let mut vim = Vim::new();
+        assert!(matches!(
+            vim.handle_key(&lines, Key::PageDown, 2),
+            Outcome::ScrollPage(1)
+        ));
+        press(&mut vim, &lines, Key::Char('i'));
+        vim.handle_key(&lines, Key::PageDown, 2);
+        assert_eq!(vim.cursor.line, 4);
+        press(&mut vim, &lines, Key::Char('V'));
+        vim.handle_key(&lines, Key::PageUp, 2);
+        assert_eq!(vim.cursor.line, 0);
+        assert_eq!(vim.selection_lines(), Some((0, 4)));
+    }
+
+    #[test]
+    fn character_visual_selection_is_inclusive() {
+        let lines = doc_lines("abcd\n");
+        let mut vim = Vim::new();
+        press(&mut vim, &lines, Key::Char('i'));
+        press(&mut vim, &lines, Key::Char('l'));
+        press(&mut vim, &lines, Key::Char('v'));
+        assert_eq!(vim.highlight_for_line(0, 4), Some(Highlight::Chars(1, 2)));
+        press(&mut vim, &lines, Key::Char('l'));
+        assert_eq!(vim.highlight_for_line(0, 4), Some(Highlight::Chars(1, 3)));
+        let Outcome::Yanked(text) = press(&mut vim, &lines, Key::Char('y')) else {
+            panic!("expected yank");
+        };
+        assert_eq!(text, "bc");
+    }
+
+    #[test]
     fn visual_selection_covers_items_until_yank() {
         let lines = doc_lines("# a\n\n# b\n\n# c\n");
         let mut vim = Vim::new();
@@ -782,9 +1155,9 @@ mod tests {
         let Outcome::Yanked(text) = press(&mut vim, &lines, Key::Char('y')) else {
             panic!("expected yank");
         };
-        assert_eq!(text, "a\n");
+        assert_eq!(text, "a\nb");
         assert_eq!(vim.selection_lines(), None);
-        assert_eq!(vim.mode, Mode::Normal);
+        assert_eq!(vim.mode, Mode::Cursor);
     }
 
     #[test]
@@ -856,9 +1229,9 @@ mod tests {
         let Outcome::Yanked(text) = press(&mut vim, &lines, Key::Char('y')) else {
             panic!("expected yank");
         };
-        assert_eq!(text, "hello world\n");
-        assert_eq!(vim.message, "yanked 12 chars");
-        assert_eq!(vim.mode, Mode::Normal);
+        assert_eq!(text, "hello world\ns");
+        assert_eq!(vim.message, "yanked 13 chars");
+        assert_eq!(vim.mode, Mode::Cursor);
     }
 
     #[test]
@@ -975,6 +1348,8 @@ mod tests {
         let lines = doc_lines("hello\n");
         let mut vim = Vim::new();
         press(&mut vim, &lines, Key::Char('v'));
+        press(&mut vim, &lines, Key::Esc);
+        assert_eq!(vim.mode, Mode::Cursor);
         press(&mut vim, &lines, Key::Esc);
         assert_eq!(vim.mode, Mode::Normal);
         for key in chars("/") {
