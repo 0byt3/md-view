@@ -80,19 +80,11 @@ struct Viewer {
 }
 
 enum Input {
-    Focus(bool),
     Vim(vim::Key),
     Zoom(f32),
 }
 
 fn map_keystroke(stroke: &Keystroke) -> Option<Input> {
-    if stroke.key == "tab"
-        && !stroke.modifiers.control
-        && !stroke.modifiers.alt
-        && !stroke.modifiers.platform
-    {
-        return Some(Input::Focus(stroke.modifiers.shift));
-    }
     if stroke.modifiers.control || stroke.modifiers.alt || stroke.modifiers.platform {
         if stroke.modifiers.control && !stroke.modifiers.alt && !stroke.modifiers.platform {
             return match stroke.key.as_str() {
@@ -1061,7 +1053,6 @@ impl Viewer {
         if is_first {
             if let Some(code) = code_block_text(&self.doc, line.block) {
                 let code = code.to_string();
-                let keyboard_code = code.clone();
                 row = row.child(
                     div()
                         .id(SharedString::from(format!("copy-code-{}", line.block)))
@@ -1075,23 +1066,13 @@ impl Viewer {
                         .border_color(rgb(theme::BORDER))
                         .bg(rgb(theme::COPY_BUTTON_BG))
                         .hover(|style| style.bg(rgb(theme::COPY_BUTTON_HOVER)))
-                        .focus_visible(|style| style.border_color(rgb(theme::LINK)))
                         .cursor_pointer()
-                        .tab_index(0)
                         .text_xs()
                         .text_color(rgb(theme::BODY))
                         .child("Copy")
                         .on_click(move |_, _, cx| {
                             cx.write_to_clipboard(ClipboardItem::new_string(code.clone()));
                             cx.stop_propagation();
-                        })
-                        .on_key_down(move |event, _, cx| {
-                            if matches!(event.keystroke.key.as_str(), "enter" | " " | "space") {
-                                cx.write_to_clipboard(ClipboardItem::new_string(
-                                    keyboard_code.clone(),
-                                ));
-                                cx.stop_propagation();
-                            }
                         }),
                 );
             }
@@ -1275,7 +1256,6 @@ impl Render for Viewer {
         div()
             .flex()
             .flex_col()
-            .tab_group()
             .font_family("Noto Sans")
             .bg(rgb(theme::BG))
             .size_full()
@@ -1357,19 +1337,11 @@ fn main() {
                 },
             )
             .unwrap();
-        cx.observe_keystrokes(move |event, window, cx| {
-            let Some(input) = map_keystroke(&event.keystroke) else {
-                return;
-            };
-            if let Input::Focus(reverse) = input {
-                if reverse {
-                    window.focus_prev(cx);
-                } else {
-                    window.focus_next(cx);
-                }
-                return;
-            }
+        cx.observe_keystrokes(move |event, _, cx| {
             view.update(cx, |view, cx| {
+                let Some(input) = map_keystroke(&event.keystroke) else {
+                    return;
+                };
                 let Input::Vim(key) = input else {
                     let Input::Zoom(delta) = input else {
                         unreachable!();
@@ -1467,14 +1439,6 @@ mod tests {
         assert!(matches!(
             map_keystroke(&Keystroke::parse("pagedown").unwrap()),
             Some(Input::Vim(vim::Key::PageDown))
-        ));
-        assert!(matches!(
-            map_keystroke(&Keystroke::parse("tab").unwrap()),
-            Some(Input::Focus(false))
-        ));
-        assert!(matches!(
-            map_keystroke(&Keystroke::parse("shift-tab").unwrap()),
-            Some(Input::Focus(true))
         ));
     }
 
