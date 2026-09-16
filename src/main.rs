@@ -1053,6 +1053,7 @@ impl Viewer {
         if is_first {
             if let Some(code) = code_block_text(&self.doc, line.block) {
                 let code = code.to_string();
+                let keyboard_code = code.clone();
                 row = row.child(
                     div()
                         .id(SharedString::from(format!("copy-code-{}", line.block)))
@@ -1066,13 +1067,23 @@ impl Viewer {
                         .border_color(rgb(theme::BORDER))
                         .bg(rgb(theme::COPY_BUTTON_BG))
                         .hover(|style| style.bg(rgb(theme::COPY_BUTTON_HOVER)))
+                        .focus_visible(|style| style.border_color(rgb(theme::LINK)))
                         .cursor_pointer()
+                        .tab_index(0)
                         .text_xs()
                         .text_color(rgb(theme::BODY))
                         .child("Copy")
                         .on_click(move |_, _, cx| {
                             cx.write_to_clipboard(ClipboardItem::new_string(code.clone()));
                             cx.stop_propagation();
+                        })
+                        .on_key_down(move |event, _, cx| {
+                            if matches!(event.keystroke.key.as_str(), "enter" | " " | "space") {
+                                cx.write_to_clipboard(ClipboardItem::new_string(
+                                    keyboard_code.clone(),
+                                ));
+                                cx.stop_propagation();
+                            }
                         }),
                 );
             }
