@@ -20,7 +20,7 @@ use gpui::{
     StrikethroughStyle, StyledText, TextRun, UnderlineStyle, Window, WindowBounds, WindowOptions,
 };
 use gpui_platform::application;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Debounce for file events; with the 100ms UI poll this re-renders a save
@@ -38,6 +38,9 @@ const HALF_PAGE_FALLBACK_PX: f32 = 240.0;
 const LIST_INDENT: f32 = 16.0;
 /// Indent added per nested blockquote level, in pixels.
 const QUOTE_INDENT: f32 = 12.0;
+const DEFAULT_ZOOM_PX: f32 = 15.0;
+const MIN_ZOOM_PX: f32 = 10.0;
+const MAX_ZOOM_PX: f32 = 24.0;
 
 /// Document sans with color-emoji fallback so GFM emoji in `example.md` render.
 fn ui_font() -> Font {
@@ -73,34 +76,40 @@ struct Viewer {
     /// When true, the next paint scrolls the cursor's row into view. Pixel
     /// `j`/`k` scrolling leaves this false so it does not fight the offset.
     follow_cursor: bool,
+    zoom_px: f32,
 }
 
-/// Map a platform keystroke to a vim key. Anything with modifiers other
-/// than a bare Ctrl-d/u/Ctrl-c is ignored.
-fn map_keystroke(stroke: &Keystroke) -> Option<vim::Key> {
+enum Input {
+    Vim(vim::Key),
+    Zoom(f32),
+}
+
+fn map_keystroke(stroke: &Keystroke) -> Option<Input> {
     if stroke.modifiers.control || stroke.modifiers.alt || stroke.modifiers.platform {
-        if stroke.modifiers.control
-            && !stroke.modifiers.alt
-            && !stroke.modifiers.platform
-            && !stroke.modifiers.shift
-        {
+        if stroke.modifiers.control && !stroke.modifiers.alt && !stroke.modifiers.platform {
             return match stroke.key.as_str() {
-                "d" => Some(vim::Key::Ctrl('d')),
-                "u" => Some(vim::Key::Ctrl('u')),
-                "c" => Some(vim::Key::Esc),
+                "d" if !stroke.modifiers.shift => Some(Input::Vim(vim::Key::Ctrl('d'))),
+                "u" if !stroke.modifiers.shift => Some(Input::Vim(vim::Key::Ctrl('u'))),
+                "c" if !stroke.modifiers.shift => Some(Input::Vim(vim::Key::Esc)),
+                "=" | "+" => Some(Input::Zoom(1.0)),
+                "-" => Some(Input::Zoom(-1.0)),
                 _ => None,
             };
         }
         return None;
     }
     match stroke.key.as_str() {
-        "escape" => Some(vim::Key::Esc),
-        "enter" => Some(vim::Key::Enter),
-        "backspace" => Some(vim::Key::Backspace),
-        "up" => Some(vim::Key::Up),
-        "down" => Some(vim::Key::Down),
-        " " | "space" => Some(vim::Key::Char(' ')),
-        _ => typed_char(stroke).map(vim::Key::Char),
+        "escape" => Some(Input::Vim(vim::Key::Esc)),
+        "enter" => Some(Input::Vim(vim::Key::Enter)),
+        "backspace" => Some(Input::Vim(vim::Key::Backspace)),
+        "left" => Some(Input::Vim(vim::Key::Left)),
+        "right" => Some(Input::Vim(vim::Key::Right)),
+        "up" => Some(Input::Vim(vim::Key::Up)),
+        "down" => Some(Input::Vim(vim::Key::Down)),
+        "pageup" => Some(Input::Vim(vim::Key::PageUp)),
+        "pagedown" => Some(Input::Vim(vim::Key::PageDown)),
+        " " | "space" => Some(Input::Vim(vim::Key::Char(' '))),
+        _ => typed_char(stroke).map(vim::Key::Char).map(Input::Vim),
     }
 }
 
@@ -119,6 +128,41 @@ fn typed_char(stroke: &Keystroke) -> Option<char> {
         return Some(ch);
     }
     None
+}
+
+fn compact_path(path: &Path, home: Option<&Path>) -> String {
+    if path.as_os_str().is_empty() {
+        return ".".to_string();
+    }
+    if let Some(home) = home {
+        if let Ok(relative) = path.strip_prefix(home) {
+            if relative.as_os_str().is_empty() {
+                return "~".to_string();
+            }
+            return format!("~/{}", relative.display());
+        }
+    }
+    path.display().to_string()
+}
+
+fn path_display(path: &Path, home: Option<&Path>) -> String {
+    let filename = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let directory = path
+        .parent()
+        .map(|parent| compact_path(parent, home))
+        .unwrap_or_else(|| ".".to_string());
+    format!("filename: {filename}    directory: {directory}")
+}
+
+fn absolute_display_path(path: &Path, current_directory: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        current_directory.join(path)
+    }
 }
 
 impl Viewer {
@@ -189,6 +233,10 @@ impl Viewer {
         }
     }
 
+    fn page_px(&self) -> f32 {
+        (self.half_page_px() * 2.0).max(LINE_SCROLL_PX)
+    }
+
     fn scroll_by_pixels(&self, dy: f32) {
         let mut offset = self.scroll.offset();
         let max = self.scroll.max_offset();
@@ -229,23 +277,20 @@ impl Viewer {
         }
     }
 
-    fn line_selected(&self, index: usize) -> bool {
-        self.vim
-            .selection_lines()
-            .is_some_and(|(start, end)| index >= start && index <= end)
+    fn line_highlight(&self, index: usize) -> Option<vim::Highlight> {
+        let char_count = self
+            .lines
+            .get(index)
+            .map(|line| line.text.chars().count())
+            .unwrap_or(0);
+        self.vim.highlight_for_line(index, char_count)
     }
 
     fn block_selected(&self, block: usize) -> bool {
-        let Some((start, end)) = self.vim.selection_lines() else {
-            return false;
-        };
-        let last = end.min(self.lines.len().saturating_sub(1));
-        if start > last {
-            return false;
-        }
-        self.lines[start..=last]
+        self.lines
             .iter()
-            .any(|line| line.block == block)
+            .enumerate()
+            .any(|(index, line)| line.block == block && self.line_highlight(index).is_some())
     }
 }
 
@@ -567,13 +612,18 @@ impl Viewer {
     /// italic, strikethrough, links, `==mark==`, `++insert++`, inline code)
     /// from a document's style-preserving [`markdown::Span`]s.
     fn build_styled_text(&self, spans: &[markdown::Span]) -> StyledText {
+        self.build_styled_text_with_highlight(spans, None)
+    }
+
+    fn build_styled_text_with_highlight(
+        &self,
+        spans: &[markdown::Span],
+        highlight: Option<(usize, usize)>,
+    ) -> StyledText {
         let mut text = String::new();
         let mut runs = Vec::with_capacity(spans.len());
+        let mut char_offset = 0;
         for span in spans {
-            let start = text.len();
-            text.push_str(&span.text);
-            let len = text.len() - start;
-
             let mut font = ui_font();
             if span.bold {
                 font = font.bold();
@@ -609,25 +659,53 @@ impl Viewer {
                     ..Default::default()
                 });
             }
-            runs.push(TextRun {
-                len,
-                font,
-                color,
-                background_color,
-                underline,
-                strikethrough,
-            });
+            let mut segments: Vec<(String, bool)> = Vec::new();
+            for ch in span.text.chars() {
+                let selected =
+                    highlight.is_some_and(|(start, end)| char_offset >= start && char_offset < end);
+                if let Some((segment, segment_selected)) = segments.last_mut() {
+                    if *segment_selected == selected {
+                        segment.push(ch);
+                    } else {
+                        segments.push((ch.to_string(), selected));
+                    }
+                } else {
+                    segments.push((ch.to_string(), selected));
+                }
+                char_offset += 1;
+            }
+            for (segment, selected) in segments {
+                let len = segment.len();
+                text.push_str(&segment);
+                runs.push(TextRun {
+                    len,
+                    font: font.clone(),
+                    color,
+                    background_color: if selected {
+                        Some(rgb(theme::BG_SELECTION).into())
+                    } else {
+                        background_color
+                    },
+                    underline,
+                    strikethrough,
+                });
+            }
         }
         StyledText::new(text).with_runs(runs)
     }
 
-    fn render_heading(&self, level: u8, spans: &[markdown::Inline]) -> AnyElement {
+    fn render_heading(
+        &self,
+        level: u8,
+        spans: &[markdown::Inline],
+        highlight: Option<(usize, usize)>,
+    ) -> AnyElement {
         let mut el = div()
             .mt_4()
             .mb_2()
             .font_weight(FontWeight::BOLD)
             .text_color(rgb(theme::BODY))
-            .child(self.build_styled_text(&markdown::spans(spans)));
+            .child(self.build_styled_text_with_highlight(&markdown::spans(spans), highlight));
         el = match level {
             1 => el.text_3xl(),
             2 => el.text_2xl(),
@@ -640,20 +718,29 @@ impl Viewer {
         el.into_any_element()
     }
 
-    fn render_paragraph(&self, spans: &[markdown::Inline]) -> AnyElement {
-        self.render_inline_flow(spans, true)
+    fn render_paragraph(
+        &self,
+        spans: &[markdown::Inline],
+        highlight: Option<(usize, usize)>,
+    ) -> AnyElement {
+        self.render_inline_flow(spans, true, highlight)
     }
 
     /// Flowing inlines: styled text, with display math broken out and centered
     /// like the GitHub-style reference PDF.
-    fn render_inline_flow(&self, inlines: &[markdown::Inline], padded: bool) -> AnyElement {
+    fn render_inline_flow(
+        &self,
+        inlines: &[markdown::Inline],
+        padded: bool,
+        highlight: Option<(usize, usize)>,
+    ) -> AnyElement {
         if inlines
             .iter()
             .all(|inline| !matches!(inline, markdown::Inline::Math { .. }))
         {
             return div()
                 .when(padded, |el| el.mb_4())
-                .child(self.build_styled_text(&markdown::spans(inlines)))
+                .child(self.build_styled_text_with_highlight(&markdown::spans(inlines), highlight))
                 .into_any_element();
         }
         let mut column = div().flex().flex_col().when(padded, |el| el.mb_4());
@@ -779,6 +866,7 @@ impl Viewer {
         spans: &[markdown::Inline],
         depth: usize,
         is_last: bool,
+        highlight: Option<(usize, usize)>,
     ) -> AnyElement {
         let marker: AnyElement = match checked {
             Some(true) => div()
@@ -814,7 +902,11 @@ impl Viewer {
             .mb_1()
             .when(is_last, |el| el.mb_4())
             .child(marker)
-            .child(div().child(self.build_styled_text(&markdown::spans(spans))))
+            .child(
+                div().child(
+                    self.build_styled_text_with_highlight(&markdown::spans(spans), highlight),
+                ),
+            )
             .into_any_element()
     }
 
@@ -874,12 +966,23 @@ impl Viewer {
             }
         }
         let is_last_in_block = self.lines.get(index + 1).map(|l| l.block) != Some(line.block);
+        let line_highlight = self.line_highlight(index);
+        let char_highlight = match line_highlight {
+            Some(vim::Highlight::Chars(start, end)) => Some((start, end)),
+            _ => None,
+        };
         let content = match &line.content {
-            vim::RowContent::Code => {
-                self.render_code_row(line, row_in_block, row_in_block == 0, is_last_in_block)
+            vim::RowContent::Code => self.render_code_row(
+                line,
+                row_in_block,
+                row_in_block == 0,
+                is_last_in_block,
+                char_highlight,
+            ),
+            vim::RowContent::Heading { level, spans } => {
+                self.render_heading(*level, spans, char_highlight)
             }
-            vim::RowContent::Heading { level, spans } => self.render_heading(*level, spans),
-            vim::RowContent::Paragraph { spans } => self.render_paragraph(spans),
+            vim::RowContent::Paragraph { spans } => self.render_paragraph(spans, char_highlight),
             vim::RowContent::ListItem {
                 ordered,
                 number,
@@ -892,6 +995,7 @@ impl Viewer {
                 spans,
                 line.list_depth,
                 is_last_in_block,
+                char_highlight,
             ),
             vim::RowContent::TableRow {
                 cells,
@@ -901,7 +1005,14 @@ impl Viewer {
             vim::RowContent::Rule => self.render_rule(),
         };
         let content = wrap_quote(line.quote_depth, content);
-        if self.line_selected(index) {
+        let composite_char_highlight = matches!(
+            (&line.content, line_highlight),
+            (
+                vim::RowContent::TableRow { .. } | vim::RowContent::Rule,
+                Some(vim::Highlight::Chars(..))
+            )
+        );
+        if matches!(line_highlight, Some(vim::Highlight::Whole)) || composite_char_highlight {
             div()
                 .bg(rgb(theme::BG_SELECTION))
                 .child(content)
@@ -921,6 +1032,7 @@ impl Viewer {
         row_in_block: usize,
         is_first: bool,
         is_last: bool,
+        highlight: Option<(usize, usize)>,
     ) -> AnyElement {
         let mut row = div()
             .flex()
@@ -932,15 +1044,28 @@ impl Viewer {
         let mut spanned = false;
         if let Some(groups) = self.code.get(&line.block) {
             if let Some(tokens) = groups.get(row_in_block) {
+                let mut char_offset = 0;
                 for token in tokens {
-                    let span = div().text_color(rgb(token.color)).child(token.text.clone());
-                    row = row.child(if token.italic { span.italic() } else { span });
+                    for (text, selected) in split_highlight(&token.text, char_offset, highlight) {
+                        let span = div()
+                            .text_color(rgb(token.color))
+                            .when(selected, |el| el.bg(rgb(theme::BG_SELECTION)))
+                            .child(text);
+                        row = row.child(if token.italic { span.italic() } else { span });
+                    }
+                    char_offset += token.text.chars().count();
                 }
                 spanned = true;
             }
         }
         if !spanned {
-            row = row.child(line.text.clone());
+            for (text, selected) in split_highlight(&line.text, 0, highlight) {
+                row = row.child(
+                    div()
+                        .when(selected, |el| el.bg(rgb(theme::BG_SELECTION)))
+                        .child(text),
+                );
+            }
         }
         row.into_any_element()
     }
@@ -1010,6 +1135,29 @@ impl Viewer {
     }
 }
 
+fn split_highlight(
+    text: &str,
+    char_offset: usize,
+    highlight: Option<(usize, usize)>,
+) -> Vec<(String, bool)> {
+    let mut segments: Vec<(String, bool)> = Vec::new();
+    for (index, ch) in text.chars().enumerate() {
+        let at = char_offset + index;
+        let selected = highlight.is_some_and(|(start, end)| at >= start && at < end);
+        if let Some((segment, segment_selected)) = segments.last_mut() {
+            if *segment_selected == selected {
+                segment.push(ch);
+                continue;
+            }
+        }
+        segments.push((ch.to_string(), selected));
+    }
+    if segments.is_empty() {
+        segments.push((String::new(), highlight.is_some()));
+    }
+    segments
+}
+
 /// Wrap a row in a left border/indent per nested `>` level. Depth 0 (not in
 /// a quote) returns the content untouched.
 fn wrap_quote(depth: usize, content: AnyElement) -> AnyElement {
@@ -1026,7 +1174,8 @@ fn wrap_quote(depth: usize, content: AnyElement) -> AnyElement {
 }
 
 impl Render for Viewer {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        window.set_rem_size(px(self.zoom_px));
         let mut rows: Vec<AnyElement> = Vec::new();
         let mut row_for_line: Vec<usize> = Vec::with_capacity(self.lines.len());
         let mut diagram_block: Option<usize> = None;
@@ -1075,17 +1224,15 @@ impl Render for Viewer {
             .size_full()
             .child(
                 div()
-                    .px_4()
-                    .pt_2()
-                    .text_lg()
+                    .px_2()
+                    .py_1()
+                    .text_sm()
                     .text_color(rgb(theme::FG_GUTTER))
-                    .child(self.banner()),
-            )
-            .child(
-                div()
-                    .px_4()
-                    .text_color(rgb(theme::FG_GUTTER))
-                    .child(self.path_display.clone()),
+                    .child(if self.missing {
+                        SharedString::from(self.banner())
+                    } else {
+                        self.path_display.clone()
+                    }),
             )
             .children(self.render_front_matter())
             .child(doc_body)
@@ -1105,6 +1252,10 @@ fn main() {
         std::process::exit(2);
     });
     let path = PathBuf::from(&path_arg);
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let current_directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let display_path = absolute_display_path(&path, &current_directory);
+    let path_label = path_display(&display_path, home.as_deref());
     let missing = !path.exists();
     let doc = markdown::parse_markdown(&markdown::load_file(&path));
     let lines = vim::build_lines(&doc);
@@ -1121,9 +1272,9 @@ fn main() {
     };
 
     application().run(move |cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(900.), px(700.)), cx);
+        let bounds = Bounds::centered(None, size(px(840.), px(640.)), cx);
         let view = cx.new(|_| Viewer {
-            path_display: path_arg.clone().into(),
+            path_display: path_label.into(),
             path,
             doc,
             lines,
@@ -1135,6 +1286,7 @@ fn main() {
             _watch: watcher,
             scroll: ScrollHandle::new(),
             follow_cursor: false,
+            zoom_px: DEFAULT_ZOOM_PX,
         });
         let window = cx
             .open_window(
@@ -1150,31 +1302,47 @@ fn main() {
             .unwrap();
         cx.observe_keystrokes(move |event, _, cx| {
             view.update(cx, |view, cx| {
-                if let Some(key) = map_keystroke(&event.keystroke) {
-                    if matches!(view.vim.mode, vim::Mode::Normal)
-                        && matches!(key, vim::Key::Char('v') | vim::Key::Char('V'))
-                    {
-                        view.snap_cursor_if_offscreen();
+                let Some(input) = map_keystroke(&event.keystroke) else {
+                    return;
+                };
+                let Input::Vim(key) = input else {
+                    let Input::Zoom(delta) = input else {
+                        unreachable!();
+                    };
+                    view.zoom_px = (view.zoom_px + delta).clamp(MIN_ZOOM_PX, MAX_ZOOM_PX);
+                    cx.notify();
+                    return;
+                };
+                if matches!(view.vim.mode, vim::Mode::Normal)
+                    && matches!(
+                        key,
+                        vim::Key::Char('i') | vim::Key::Char('v') | vim::Key::Char('V')
+                    )
+                {
+                    view.snap_cursor_if_offscreen();
+                }
+                let half = view.half_page();
+                match view.vim.handle_key(&view.lines, key, half) {
+                    vim::Outcome::Changed => {
+                        view.follow_cursor = true;
+                        cx.notify();
                     }
-                    let half = view.half_page();
-                    match view.vim.handle_key(&view.lines, key, half) {
-                        vim::Outcome::Changed => {
-                            view.follow_cursor = true;
-                            cx.notify();
-                        }
-                        vim::Outcome::Ignored => {}
-                        vim::Outcome::Yanked(text) => {
-                            cx.write_to_clipboard(ClipboardItem::new_string(text));
-                            cx.notify();
-                        }
-                        vim::Outcome::Scroll(steps) => {
-                            view.scroll_by_pixels(LINE_SCROLL_PX * steps as f32);
-                            cx.notify();
-                        }
-                        vim::Outcome::ScrollHalf(times) => {
-                            view.scroll_by_pixels(view.half_page_px() * times as f32);
-                            cx.notify();
-                        }
+                    vim::Outcome::Ignored => {}
+                    vim::Outcome::Yanked(text) => {
+                        cx.write_to_clipboard(ClipboardItem::new_string(text));
+                        cx.notify();
+                    }
+                    vim::Outcome::Scroll(steps) => {
+                        view.scroll_by_pixels(LINE_SCROLL_PX * steps as f32);
+                        cx.notify();
+                    }
+                    vim::Outcome::ScrollHalf(times) => {
+                        view.scroll_by_pixels(view.half_page_px() * times as f32);
+                        cx.notify();
+                    }
+                    vim::Outcome::ScrollPage(times) => {
+                        view.scroll_by_pixels(view.page_px() * times as f32);
+                        cx.notify();
                     }
                 }
             })
@@ -1194,4 +1362,58 @@ fn main() {
         .detach();
         cx.activate(true);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn path_bar_splits_filename_and_contracts_home() {
+        let home = Path::new("/home/alex");
+        assert_eq!(
+            path_display(Path::new("/home/alex/docs/notes.md"), Some(home)),
+            "filename: notes.md    directory: ~/docs"
+        );
+        assert_eq!(
+            path_display(Path::new("/home/alex2/notes.md"), Some(home)),
+            "filename: notes.md    directory: /home/alex2"
+        );
+        assert_eq!(
+            path_display(Path::new("notes.md"), Some(home)),
+            "filename: notes.md    directory: ."
+        );
+        assert_eq!(
+            absolute_display_path(Path::new("docs/notes.md"), home),
+            PathBuf::from("/home/alex/docs/notes.md")
+        );
+    }
+
+    #[test]
+    fn maps_zoom_and_page_keys() {
+        assert!(matches!(
+            map_keystroke(&Keystroke::parse("ctrl-=").unwrap()),
+            Some(Input::Zoom(1.0))
+        ));
+        assert!(matches!(
+            map_keystroke(&Keystroke::parse("ctrl--").unwrap()),
+            Some(Input::Zoom(-1.0))
+        ));
+        assert!(matches!(
+            map_keystroke(&Keystroke::parse("pagedown").unwrap()),
+            Some(Input::Vim(vim::Key::PageDown))
+        ));
+    }
+
+    #[test]
+    fn character_highlight_segments_keep_unicode_intact() {
+        assert_eq!(
+            split_highlight("a😀c", 0, Some((1, 2))),
+            vec![
+                ("a".to_string(), false),
+                ("😀".to_string(), true),
+                ("c".to_string(), false),
+            ]
+        );
+    }
 }
