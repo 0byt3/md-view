@@ -309,6 +309,13 @@ fn diagram_cache(doc: &markdown::Document) -> std::collections::HashMap<usize, m
         .collect()
 }
 
+fn code_block_text(doc: &markdown::Document, block: usize) -> Option<&str> {
+    match doc.blocks.get(block) {
+        Some(markdown::Block::Code { text, .. }) => Some(text),
+        _ => None,
+    }
+}
+
 /// Paint vector strokes and filled arrowheads on a canvas that fills its
 /// relatively-positioned container.
 ///
@@ -1035,12 +1042,41 @@ impl Viewer {
         highlight: Option<(usize, usize)>,
     ) -> AnyElement {
         let mut row = div()
+            .relative()
             .flex()
             .flex_row()
             .bg(rgb(theme::CODE_BG))
             .px_3()
+            .when(is_first, |el| el.pr(px(76.0)))
             .when(is_first, |el| el.pt_2().mt_2().rounded_t_md())
             .when(is_last, |el| el.pb_2().mb_4().rounded_b_md());
+        if is_first {
+            if let Some(code) = code_block_text(&self.doc, line.block) {
+                let code = code.to_string();
+                row = row.child(
+                    div()
+                        .id(SharedString::from(format!("copy-code-{}", line.block)))
+                        .absolute()
+                        .right_2()
+                        .top_2()
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(rgb(theme::BORDER))
+                        .bg(rgb(theme::COPY_BUTTON_BG))
+                        .hover(|style| style.bg(rgb(theme::COPY_BUTTON_HOVER)))
+                        .cursor_pointer()
+                        .text_xs()
+                        .text_color(rgb(theme::BODY))
+                        .child("Copy")
+                        .on_click(move |_, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(code.clone()));
+                            cx.stop_propagation();
+                        }),
+                );
+            }
+        }
         let mut spanned = false;
         if let Some(groups) = self.code.get(&line.block) {
             if let Some(tokens) = groups.get(row_in_block) {
@@ -1415,6 +1451,15 @@ mod tests {
                 ("😀".to_string(), true),
                 ("c".to_string(), false),
             ]
+        );
+    }
+
+    #[test]
+    fn code_copy_text_uses_the_complete_fence() {
+        let doc = markdown::parse_markdown("```rust\nlet x = 1;\nlet y = 2;\n```\n");
+        assert_eq!(
+            code_block_text(&doc, 0),
+            Some("let x = 1;\nlet y = 2;\n")
         );
     }
 }
