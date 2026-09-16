@@ -1457,9 +1457,6 @@ mod tests {
     #[test]
     fn code_copy_text_uses_the_complete_fence() {
         let doc = markdown::parse_markdown("```rust\nlet x = 1;\nlet y = 2;\n```\n");
-        assert_eq!(
-            code_block_text(&doc, 0),
-            Some("let x = 1;\nlet y = 2;\n")
-        );
+        assert_eq!(code_block_text(&doc, 0), Some("let x = 1;\nlet y = 2;\n"));
     }
 }
