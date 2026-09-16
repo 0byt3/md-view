@@ -80,11 +80,19 @@ struct Viewer {
 }
 
 enum Input {
+    Focus(bool),
     Vim(vim::Key),
     Zoom(f32),
 }
 
 fn map_keystroke(stroke: &Keystroke) -> Option<Input> {
+    if stroke.key == "tab"
+        && !stroke.modifiers.control
+        && !stroke.modifiers.alt
+        && !stroke.modifiers.platform
+    {
+        return Some(Input::Focus(stroke.modifiers.shift));
+    }
     if stroke.modifiers.control || stroke.modifiers.alt || stroke.modifiers.platform {
         if stroke.modifiers.control && !stroke.modifiers.alt && !stroke.modifiers.platform {
             return match stroke.key.as_str() {
@@ -1267,6 +1275,7 @@ impl Render for Viewer {
         div()
             .flex()
             .flex_col()
+            .tab_group()
             .font_family("Noto Sans")
             .bg(rgb(theme::BG))
             .size_full()
@@ -1348,11 +1357,19 @@ fn main() {
                 },
             )
             .unwrap();
-        cx.observe_keystrokes(move |event, _, cx| {
+        cx.observe_keystrokes(move |event, window, cx| {
+            let Some(input) = map_keystroke(&event.keystroke) else {
+                return;
+            };
+            if let Input::Focus(reverse) = input {
+                if reverse {
+                    window.focus_prev(cx);
+                } else {
+                    window.focus_next(cx);
+                }
+                return;
+            }
             view.update(cx, |view, cx| {
-                let Some(input) = map_keystroke(&event.keystroke) else {
-                    return;
-                };
                 let Input::Vim(key) = input else {
                     let Input::Zoom(delta) = input else {
                         unreachable!();
@@ -1450,6 +1467,14 @@ mod tests {
         assert!(matches!(
             map_keystroke(&Keystroke::parse("pagedown").unwrap()),
             Some(Input::Vim(vim::Key::PageDown))
+        ));
+        assert!(matches!(
+            map_keystroke(&Keystroke::parse("tab").unwrap()),
+            Some(Input::Focus(false))
+        ));
+        assert!(matches!(
+            map_keystroke(&Keystroke::parse("shift-tab").unwrap()),
+            Some(Input::Focus(true))
         ));
     }
 
