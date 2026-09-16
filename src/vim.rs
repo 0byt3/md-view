@@ -348,8 +348,7 @@ impl Vim {
     }
 
     /// Inclusive line range covered by the current visual selection, if any.
-    /// Both character-wise (`v`) and line-wise (`V`) highlight whole items
-    /// (rows); yank still uses character vs line extents.
+    #[cfg(test)]
     pub fn selection_lines(&self) -> Option<(usize, usize)> {
         match &self.mode {
             Mode::Visual { anchor, .. } => {
