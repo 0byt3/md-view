@@ -4,12 +4,12 @@
 //! reference of `example.md`); code token colors follow the Neovim
 //! `tokyo_custom` palette in `~/.config/nvim/lua/colors/tokyo_custom.lua`.
 
-/// Window background (`tokyo_custom` `bg`).
-pub const BG: u32 = 0x1a1b26;
+/// Window background.
+pub const BG: u32 = 0x0B1F33;
 /// Primary text (`tokyo_custom` `fg`).
 pub const FG: u32 = 0xc0caf5;
-/// Muted text and gutters (`tokyo_custom` `fg_gutter`).
-pub const FG_GUTTER: u32 = 0x3b4261;
+/// Muted text and gutters.
+pub const FG_GUTTER: u32 = 0x8B949E;
 /// Comments (`tokyo_custom` `comment`).
 pub const COMMENT: u32 = 0x565f89;
 /// Strings (`tokyo_custom` light green).
@@ -27,8 +27,8 @@ pub const OPERATOR: u32 = 0x89ddff;
 /// Links and headings accent (`tokyo_custom` blue).
 #[allow(dead_code)]
 pub const BLUE: u32 = 0x7aa2f7;
-/// Visual selection background (`tokyo_custom` `bg_selection`).
-pub const BG_SELECTION: u32 = 0x283457;
+/// Visual selection background.
+pub const BG_SELECTION: u32 = 0x1F4B73;
 
 // ---------------------------------------------------------------------------
 // Document chrome sampled from `example-rendered.pdf` (150 DPI render).
@@ -40,6 +40,9 @@ pub const BG_SELECTION: u32 = 0x283457;
 pub const PAGE_BG: u32 = 0x0D1117;
 /// Code blocks, table cells, tag pills (`#161B22` sampled).
 pub const BLOCK_BG: u32 = 0x161B22;
+pub const CODE_BG: u32 = 0x060708;
+pub const COPY_BUTTON_BG: u32 = 0x13283F;
+pub const COPY_BUTTON_HOVER: u32 = 0x1B3A57;
 /// Alternate table row (`#1C2128` sampled zebra stripe).
 pub const ROW_ALT_BG: u32 = 0x1C2128;
 /// Borders and rules (`#30363D` sampled).
@@ -81,6 +84,7 @@ mod tests {
     fn chrome_contrast_ordering() {
         assert!(luminance(BODY) > luminance(BLOCK_BG));
         assert!(luminance(BLOCK_BG) > luminance(PAGE_BG));
+        assert!(luminance(PAGE_BG) > luminance(CODE_BG));
         assert!(luminance(ROW_ALT_BG) > luminance(PAGE_BG));
         assert!(luminance(LINK) > luminance(PAGE_BG));
         assert!(luminance(MARK_BG) > luminance(MARK_FG));
@@ -92,6 +96,9 @@ mod tests {
         let entries = [
             PAGE_BG,
             BLOCK_BG,
+            CODE_BG,
+            COPY_BUTTON_BG,
+            COPY_BUTTON_HOVER,
             ROW_ALT_BG,
             BORDER,
             BODY,

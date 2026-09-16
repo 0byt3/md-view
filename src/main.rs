@@ -1037,7 +1037,7 @@ impl Viewer {
         let mut row = div()
             .flex()
             .flex_row()
-            .bg(rgb(theme::BLOCK_BG))
+            .bg(rgb(theme::CODE_BG))
             .px_3()
             .when(is_first, |el| el.pt_2().mt_2().rounded_t_md())
             .when(is_last, |el| el.pb_2().mb_4().rounded_b_md());
@@ -1078,7 +1078,7 @@ impl Viewer {
             .border_color(rgb(theme::LINK))
             .bg(rgb(theme::BLOCK_BG))
             .text_color(rgb(theme::LINK))
-            .text_sm()
+            .text_xs()
             .child(text.to_string())
             .into_any_element()
     }
@@ -1094,16 +1094,17 @@ impl Viewer {
         let mut table = div()
             .flex()
             .flex_col()
-            .mb_4()
+            .mb_3()
             .border_1()
             .border_color(rgb(theme::BORDER))
             .rounded_md()
-            .bg(rgb(theme::BLOCK_BG));
+            .bg(rgb(theme::BLOCK_BG))
+            .text_sm();
         for (i, (key, value)) in self.doc.front_matter.iter().enumerate() {
             let key_el = div()
-                .w(px(120.0))
-                .px_3()
-                .py_2()
+                .w(px(92.0))
+                .px_2()
+                .py_1()
                 .border_r_1()
                 .border_color(rgb(theme::BORDER))
                 .flex()
@@ -1111,7 +1112,7 @@ impl Viewer {
                 .text_color(rgb(theme::FG_GUTTER))
                 .child(key.clone());
             let value_el: AnyElement = if key.eq_ignore_ascii_case("tags") {
-                let mut pills = div().flex().flex_row().flex_wrap().gap_2().px_3().py_2();
+                let mut pills = div().flex().flex_row().flex_wrap().gap_1().px_2().py_1();
                 for tag in markdown::tag_list(value) {
                     pills = pills.child(self.pill(&tag));
                 }
@@ -1119,8 +1120,8 @@ impl Viewer {
             } else {
                 div()
                     .flex_1()
-                    .px_3()
-                    .py_2()
+                    .px_2()
+                    .py_1()
                     .text_color(rgb(theme::BODY))
                     .child(value.clone())
                     .into_any_element()
