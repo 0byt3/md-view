@@ -5,7 +5,7 @@
 //! `tokyo_custom` palette in `~/.config/nvim/lua/colors/tokyo_custom.lua`.
 
 /// Window background.
-pub const BG: u32 = 0x0B1F33;
+pub const BG: u32 = 0x101820;
 /// Primary text (`tokyo_custom` `fg`).
 pub const FG: u32 = 0xc0caf5;
 /// Muted text and gutters.
@@ -78,6 +78,16 @@ mod tests {
         assert_ne!(BG, FG);
         assert_ne!(BG, BG_SELECTION);
         assert_ne!(FG, FG_GUTTER);
+    }
+
+    #[test]
+    fn chrome_blue_is_subtle() {
+        let channel = |color: u32, shift: u32| ((color >> shift) & 0xFF) as u8;
+        assert!(channel(BG, 0) > channel(BG, 16));
+        let distance = channel(BG, 16).abs_diff(channel(PAGE_BG, 16)) as u16
+            + channel(BG, 8).abs_diff(channel(PAGE_BG, 8)) as u16
+            + channel(BG, 0).abs_diff(channel(PAGE_BG, 0)) as u16;
+        assert!(distance < 24);
     }
 
     #[test]
