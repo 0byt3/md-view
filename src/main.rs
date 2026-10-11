@@ -1379,6 +1379,7 @@ fn main() {
         let window = cx
             .open_window(
                 WindowOptions {
+                    app_id: Some("md-view".to_string()),
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     ..Default::default()
                 },

@@ -50,6 +50,7 @@ Terminal=false
 NoDisplay=false
 Categories=Utility;
 MimeType=${mime_list}
+StartupWMClass=${APP_ID}
 EOF
 }
 
