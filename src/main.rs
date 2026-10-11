@@ -39,6 +39,9 @@ const LIST_INDENT: f32 = 16.0;
 /// Indent added per nested blockquote level, in pixels.
 const QUOTE_INDENT: f32 = 12.0;
 const DEFAULT_ZOOM_PX: f32 = 15.0;
+/// How long the "Copied to clipboard" confirmation stays visible next to a
+/// code block's Copy button after it is clicked.
+const COPIED_MESSAGE_DURATION: Duration = Duration::from_millis(1500);
 const MIN_ZOOM_PX: f32 = 10.0;
 const MAX_ZOOM_PX: f32 = 24.0;
 
@@ -77,6 +80,14 @@ struct Viewer {
     /// `j`/`k` scrolling leaves this false so it does not fight the offset.
     follow_cursor: bool,
     zoom_px: f32,
+    /// Block index whose Copy button was most recently clicked. While set, a
+    /// transient "Copied to clipboard" confirmation renders next to that
+    /// block's Copy button.
+    copied_block: Option<usize>,
+    /// Bumped on every copy so a stale hide-timer can never clear a newer
+    /// confirmation (e.g. when a second block is copied before the first
+    /// confirmation has faded).
+    copy_generation: u64,
 }
 
 enum Input {
@@ -865,6 +876,9 @@ impl Viewer {
         }
     }
 
+    // Pre-existing row renderer with one argument over clippy's default limit;
+    // it is a flat list of independent styling inputs, not worth a wrapper.
+    #[allow(clippy::too_many_arguments)]
     fn render_list_item(
         &self,
         ordered: bool,
@@ -965,7 +979,7 @@ impl Viewer {
 
     /// One document row: highlighted token spans for code lines, or the
     /// rich element matching its [`vim::RowContent`] otherwise.
-    fn render_line(&self, index: usize, line: &vim::Line) -> AnyElement {
+    fn render_line(&self, index: usize, line: &vim::Line, cx: &mut Context<Self>) -> AnyElement {
         let mut row_in_block = 0;
         for candidate in self.lines.iter().take(index) {
             if candidate.block == line.block {
@@ -985,6 +999,7 @@ impl Viewer {
                 row_in_block == 0,
                 is_last_in_block,
                 char_highlight,
+                cx,
             ),
             vim::RowContent::Heading { level, spans } => {
                 self.render_heading(*level, spans, char_highlight)
@@ -1040,6 +1055,7 @@ impl Viewer {
         is_first: bool,
         is_last: bool,
         highlight: Option<(usize, usize)>,
+        cx: &mut Context<Self>,
     ) -> AnyElement {
         let mut row = div()
             .relative()
@@ -1053,28 +1069,61 @@ impl Viewer {
         if is_first {
             if let Some(code) = code_block_text(&self.doc, line.block) {
                 let code = code.to_string();
-                row = row.child(
-                    div()
-                        .id(SharedString::from(format!("copy-code-{}", line.block)))
-                        .absolute()
-                        .right_2()
-                        .top_2()
-                        .px_2()
-                        .py_1()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(rgb(theme::BORDER))
-                        .bg(rgb(theme::COPY_BUTTON_BG))
-                        .hover(|style| style.bg(rgb(theme::COPY_BUTTON_HOVER)))
-                        .cursor_pointer()
-                        .text_xs()
-                        .text_color(rgb(theme::BODY))
-                        .child("Copy")
-                        .on_click(move |_, _, cx| {
-                            cx.write_to_clipboard(ClipboardItem::new_string(code.clone()));
-                            cx.stop_propagation();
-                        }),
-                );
+                let block = line.block;
+                let button = div()
+                    .id(SharedString::from(format!("copy-code-{block}")))
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(theme::BORDER))
+                    .bg(rgb(theme::COPY_BUTTON_BG))
+                    .hover(|style| style.bg(rgb(theme::COPY_BUTTON_HOVER)))
+                    .cursor_pointer()
+                    .text_xs()
+                    .text_color(rgb(theme::BODY))
+                    .child("Copy")
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(code.clone()));
+                        view.copied_block = Some(block);
+                        view.copy_generation = view.copy_generation.wrapping_add(1);
+                        let generation = view.copy_generation;
+                        // Fade the confirmation after a short delay, unless a
+                        // newer copy has replaced it in the meantime.
+                        cx.spawn(async move |view, cx| {
+                            cx.background_executor()
+                                .timer(COPIED_MESSAGE_DURATION)
+                                .await;
+                            view.update(cx, |view, cx| {
+                                if view.copy_generation == generation {
+                                    view.copied_block = None;
+                                    cx.notify();
+                                }
+                            })
+                            .ok();
+                        })
+                        .detach();
+                        cx.stop_propagation();
+                        cx.notify();
+                    }));
+                let mut controls = div()
+                    .absolute()
+                    .right_2()
+                    .top_2()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2();
+                if self.copied_block == Some(block) {
+                    controls = controls.child(
+                        div()
+                            .px_1()
+                            .text_xs()
+                            .text_color(rgb(theme::GREEN))
+                            .child("Copied to clipboard"),
+                    );
+                }
+                row = row.child(controls.child(button));
             }
         }
         let mut spanned = false;
@@ -1211,7 +1260,7 @@ fn wrap_quote(depth: usize, content: AnyElement) -> AnyElement {
 }
 
 impl Render for Viewer {
-    fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         window.set_rem_size(px(self.zoom_px));
         let mut rows: Vec<AnyElement> = Vec::new();
         let mut row_for_line: Vec<usize> = Vec::with_capacity(self.lines.len());
@@ -1231,7 +1280,7 @@ impl Render for Viewer {
             } else {
                 diagram_block = None;
                 row_for_line.push(rows.len());
-                rows.push(self.render_line(index, line));
+                rows.push(self.render_line(index, line, cx));
             }
         }
         // Cursor-moving commands ask to keep the target row in view. Normal
@@ -1324,6 +1373,8 @@ fn main() {
             scroll: ScrollHandle::new(),
             follow_cursor: false,
             zoom_px: DEFAULT_ZOOM_PX,
+            copied_block: None,
+            copy_generation: 0,
         });
         let window = cx
             .open_window(
