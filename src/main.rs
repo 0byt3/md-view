@@ -16,11 +16,13 @@ mod watch;
 
 use gpui::{
     canvas, div, point, prelude::*, px, rgb, size, AnyElement, App, Bounds, ClipboardItem, Context,
-    Font, FontFallbacks, FontWeight, Keystroke, PathBuilder, ScrollHandle, SharedString,
+    Font, FontFallbacks, FontWeight, Keystroke, PathBuilder, Pixels, ScrollHandle, SharedString,
     StrikethroughStyle, StyledText, TextRun, UnderlineStyle, Window, WindowBounds, WindowOptions,
+    WindowTextSystem,
 };
 use gpui_platform::application;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::time::Duration;
 
 /// Debounce for file events; with the 100ms UI poll this re-renders a save
@@ -638,77 +640,7 @@ impl Viewer {
         spans: &[markdown::Span],
         highlight: Option<(usize, usize)>,
     ) -> StyledText {
-        let mut text = String::new();
-        let mut runs = Vec::with_capacity(spans.len());
-        let mut char_offset = 0;
-        for span in spans {
-            let mut font = ui_font();
-            if span.bold {
-                font = font.bold();
-            }
-            if span.italic {
-                font = font.italic();
-            }
-
-            let mut color = rgb(theme::BODY).into();
-            let mut background_color = None;
-            let mut underline = None;
-            let mut strikethrough = None;
-            if span.code {
-                background_color = Some(rgb(theme::BLOCK_BG).into());
-            }
-            if span.link {
-                // GitHub-style: colored, not underlined by default.
-                color = rgb(theme::LINK).into();
-            }
-            if span.insert {
-                underline = Some(UnderlineStyle {
-                    thickness: px(1.0),
-                    ..Default::default()
-                });
-            }
-            if span.mark {
-                color = rgb(theme::MARK_FG).into();
-                background_color = Some(rgb(theme::MARK_BG).into());
-            }
-            if span.strike {
-                strikethrough = Some(StrikethroughStyle {
-                    thickness: px(1.0),
-                    ..Default::default()
-                });
-            }
-            let mut segments: Vec<(String, bool)> = Vec::new();
-            for ch in span.text.chars() {
-                let selected =
-                    highlight.is_some_and(|(start, end)| char_offset >= start && char_offset < end);
-                if let Some((segment, segment_selected)) = segments.last_mut() {
-                    if *segment_selected == selected {
-                        segment.push(ch);
-                    } else {
-                        segments.push((ch.to_string(), selected));
-                    }
-                } else {
-                    segments.push((ch.to_string(), selected));
-                }
-                char_offset += 1;
-            }
-            for (segment, selected) in segments {
-                let len = segment.len();
-                text.push_str(&segment);
-                runs.push(TextRun {
-                    len,
-                    font: font.clone(),
-                    color,
-                    background_color: if selected {
-                        Some(rgb(theme::BG_SELECTION).into())
-                    } else {
-                        background_color
-                    },
-                    underline,
-                    strikethrough,
-                });
-            }
-        }
+        let (text, runs) = styled_runs(spans, highlight);
         StyledText::new(text).with_runs(runs)
     }
 
@@ -717,9 +649,10 @@ impl Viewer {
         level: u8,
         spans: &[markdown::Inline],
         highlight: Option<(usize, usize)>,
+        first: bool,
     ) -> AnyElement {
         let mut el = div()
-            .mt_4()
+            .when(!first, |el| if level <= 2 { el.mt_8() } else { el.mt_6() })
             .mb_2()
             .font_weight(FontWeight::BOLD)
             .text_color(rgb(theme::BODY))
@@ -924,13 +857,74 @@ impl Viewer {
             .when(is_last, |el| el.mb_4())
             .child(marker)
             .child(
-                div().child(
+                // `min_w_0` lets the text shrink to the row and wrap; text
+                // reports its unwrapped width as its min-content size.
+                div().flex_1().min_w_0().child(
                     self.build_styled_text_with_highlight(&markdown::spans(spans), highlight),
                 ),
             )
             .into_any_element()
     }
 
+    /// Column widths shared by every row of each table, keyed by line index.
+    /// Rows render as separate scroll children, so without a shared layout
+    /// each row would size its columns from its own content alone.
+    fn table_layouts(&self, window: &Window) -> std::collections::HashMap<usize, Rc<[f32]>> {
+        let rem: f32 = window.rem_size().into();
+        let page_width = f32::from(window.viewport_size().width) - 2.0 * rem;
+        // Cell horizontal padding (`px_2` on both sides), both borders, and a
+        // pixel of slack so layout rounding never forces an extra wrap.
+        let chrome = rem + 3.0;
+        let text_system = window.text_system();
+        let font_size = window.rem_size();
+        let mut layouts = std::collections::HashMap::new();
+        let mut start = 0;
+        while start < self.lines.len() {
+            let line = &self.lines[start];
+            if !matches!(line.content, vim::RowContent::TableRow { header: true, .. }) {
+                start += 1;
+                continue;
+            }
+            let body_rows = self.lines[start + 1..]
+                .iter()
+                .take_while(|next| {
+                    next.block == line.block
+                        && matches!(
+                            next.content,
+                            vim::RowContent::TableRow { header: false, .. }
+                        )
+                })
+                .count();
+            let end = start + 1 + body_rows;
+            let mut min: Vec<f32> = Vec::new();
+            let mut max: Vec<f32> = Vec::new();
+            for row in &self.lines[start..end] {
+                let vim::RowContent::TableRow { cells, header, .. } = &row.content else {
+                    continue;
+                };
+                if cells.len() > min.len() {
+                    min.resize(cells.len(), chrome);
+                    max.resize(cells.len(), chrome);
+                }
+                for (column, cell) in cells.iter().enumerate() {
+                    let (word, full) =
+                        measure_spans(&table_cell_spans(cell, *header), text_system, font_size);
+                    min[column] = min[column].max(word.ceil() + chrome);
+                    max[column] = max[column].max(full.ceil() + chrome);
+                }
+            }
+            let available = page_width - quote_inset(line.quote_depth, rem);
+            let widths: Rc<[f32]> = distribute_columns(&min, &max, available).into();
+            for index in start..end {
+                layouts.insert(index, widths.clone());
+            }
+            start = end;
+        }
+        layouts
+    }
+
+    // A flat list of independent styling inputs, not worth a wrapper.
+    #[allow(clippy::too_many_arguments)]
     fn render_table_row(
         &self,
         cells: &[Vec<markdown::Inline>],
@@ -938,31 +932,45 @@ impl Viewer {
         header: bool,
         row_in_block: usize,
         is_last: bool,
+        columns: &[f32],
     ) -> AnyElement {
-        let mut row = div().flex().flex_row().when(is_last, |el| el.mb_4());
+        let border = rgb(theme::BORDER);
+        let mut row = div()
+            .flex()
+            .flex_row()
+            .border_color(border)
+            .when(!columns.is_empty(), |el| {
+                el.w(px(columns.iter().sum::<f32>()))
+            })
+            .when(is_last, |el| el.border_b_1().mb_4());
         if header {
             row = row.bg(rgb(theme::BLOCK_BG));
         } else if row_in_block.is_multiple_of(2) {
             // row_in_block 0 is always the header; even body rows tint.
             row = row.bg(rgb(theme::ROW_ALT_BG));
         }
+        let last_column = cells.len().saturating_sub(1);
         for (i, cell) in cells.iter().enumerate() {
             let align = alignments.get(i).copied().unwrap_or(markdown::Align::None);
+            // Top and left borders only (plus the outer right/bottom edges) so
+            // neighbouring cells share a single 1px line.
             let mut cell_el = div()
-                .flex_1()
-                .border_1()
-                .border_color(rgb(theme::BORDER))
+                .border_t_1()
+                .border_l_1()
+                .when(i == last_column, |el| el.border_r_1())
+                .border_color(border)
                 .px_2()
                 .py_1()
-                .child(self.build_styled_text(&markdown::spans(cell)));
+                .child(self.build_styled_text(&table_cell_spans(cell, header)));
+            cell_el = match columns.get(i) {
+                Some(width) => cell_el.flex_none().w(px(*width)),
+                None => cell_el.flex_1().min_w_0(),
+            };
             cell_el = match align {
                 markdown::Align::Left | markdown::Align::None => cell_el.text_left(),
                 markdown::Align::Center => cell_el.text_center(),
                 markdown::Align::Right => cell_el.text_right(),
             };
-            if header {
-                cell_el = cell_el.font_weight(FontWeight::BOLD);
-            }
             row = row.child(cell_el);
         }
         row.into_any_element()
@@ -979,7 +987,13 @@ impl Viewer {
 
     /// One document row: highlighted token spans for code lines, or the
     /// rich element matching its [`vim::RowContent`] otherwise.
-    fn render_line(&self, index: usize, line: &vim::Line, cx: &mut Context<Self>) -> AnyElement {
+    fn render_line(
+        &self,
+        index: usize,
+        line: &vim::Line,
+        table_columns: Option<&[f32]>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let mut row_in_block = 0;
         for candidate in self.lines.iter().take(index) {
             if candidate.block == line.block {
@@ -1002,7 +1016,7 @@ impl Viewer {
                 cx,
             ),
             vim::RowContent::Heading { level, spans } => {
-                self.render_heading(*level, spans, char_highlight)
+                self.render_heading(*level, spans, char_highlight, index == 0)
             }
             vim::RowContent::Paragraph { spans } => self.render_paragraph(spans, char_highlight),
             vim::RowContent::ListItem {
@@ -1023,7 +1037,14 @@ impl Viewer {
                 cells,
                 alignments,
                 header,
-            } => self.render_table_row(cells, alignments, *header, row_in_block, is_last_in_block),
+            } => self.render_table_row(
+                cells,
+                alignments,
+                *header,
+                row_in_block,
+                is_last_in_block,
+                table_columns.unwrap_or_default(),
+            ),
             vim::RowContent::Rule => self.render_rule(),
         };
         let content = wrap_quote(line.quote_depth, content);
@@ -1221,6 +1242,157 @@ impl Viewer {
     }
 }
 
+/// Flatten styled spans into the text and per-run styling a [`StyledText`]
+/// paints, with `highlight` (a char range) drawn as a selection background.
+fn styled_runs(
+    spans: &[markdown::Span],
+    highlight: Option<(usize, usize)>,
+) -> (String, Vec<TextRun>) {
+    let mut text = String::new();
+    let mut runs = Vec::with_capacity(spans.len());
+    let mut char_offset = 0;
+    for span in spans {
+        let mut font = ui_font();
+        if span.bold {
+            font = font.bold();
+        }
+        if span.italic {
+            font = font.italic();
+        }
+
+        let mut color = rgb(theme::BODY).into();
+        let mut background_color = None;
+        let mut underline = None;
+        let mut strikethrough = None;
+        if span.code {
+            background_color = Some(rgb(theme::BLOCK_BG).into());
+        }
+        if span.link {
+            // GitHub-style: colored, not underlined by default.
+            color = rgb(theme::LINK).into();
+        }
+        if span.insert {
+            underline = Some(UnderlineStyle {
+                thickness: px(1.0),
+                ..Default::default()
+            });
+        }
+        if span.mark {
+            color = rgb(theme::MARK_FG).into();
+            background_color = Some(rgb(theme::MARK_BG).into());
+        }
+        if span.strike {
+            strikethrough = Some(StrikethroughStyle {
+                thickness: px(1.0),
+                ..Default::default()
+            });
+        }
+        let mut segments: Vec<(String, bool)> = Vec::new();
+        for ch in span.text.chars() {
+            let selected =
+                highlight.is_some_and(|(start, end)| char_offset >= start && char_offset < end);
+            if let Some((segment, segment_selected)) = segments.last_mut() {
+                if *segment_selected == selected {
+                    segment.push(ch);
+                } else {
+                    segments.push((ch.to_string(), selected));
+                }
+            } else {
+                segments.push((ch.to_string(), selected));
+            }
+            char_offset += 1;
+        }
+        for (segment, selected) in segments {
+            let len = segment.len();
+            text.push_str(&segment);
+            runs.push(TextRun {
+                len,
+                font: font.clone(),
+                color,
+                background_color: if selected {
+                    Some(rgb(theme::BG_SELECTION).into())
+                } else {
+                    background_color
+                },
+                underline,
+                strikethrough,
+            });
+        }
+    }
+    (text, runs)
+}
+
+/// Spans for one table cell; header cells are bolded here because explicit
+/// text runs override any `font_weight` set on the containing element.
+fn table_cell_spans(cell: &[markdown::Inline], header: bool) -> Vec<markdown::Span> {
+    let mut spans = markdown::spans(cell);
+    if header {
+        for span in &mut spans {
+            span.bold = true;
+        }
+    }
+    spans
+}
+
+/// Unwrapped width of `spans`, and the width of their widest single word.
+fn measure_spans(
+    spans: &[markdown::Span],
+    text_system: &WindowTextSystem,
+    font_size: Pixels,
+) -> (f32, f32) {
+    let width_of = |spans: &[markdown::Span]| -> f32 {
+        let (text, runs) = styled_runs(spans, None);
+        if text.is_empty() {
+            return 0.0;
+        }
+        text_system
+            .layout_line(&text, font_size, &runs, None)
+            .width
+            .into()
+    };
+    let full = width_of(spans);
+    let widest_word = spans
+        .iter()
+        .flat_map(|span| {
+            span.text.split_whitespace().map(|word| markdown::Span {
+                text: word.to_string(),
+                ..span.clone()
+            })
+        })
+        .map(|word| width_of(std::slice::from_ref(&word)))
+        .fold(0.0, f32::max);
+    (widest_word, full)
+}
+
+/// Border-box column widths for one table, in the spirit of HTML's
+/// automatic table layout: every column gets at least its widest word, and
+/// the remaining width goes to columns in proportion to how much more room
+/// their unwrapped content wants.
+fn distribute_columns(min: &[f32], max: &[f32], available: f32) -> Vec<f32> {
+    let total_max: f32 = max.iter().sum();
+    if total_max <= available {
+        return max.to_vec();
+    }
+    let total_min: f32 = min.iter().sum();
+    if total_min >= available {
+        return min.to_vec();
+    }
+    let scale = (available - total_min) / (total_max - total_min);
+    min.iter()
+        .zip(max)
+        .map(|(lo, hi)| (lo + (hi - lo) * scale).floor())
+        .collect()
+}
+
+/// Horizontal space a row loses to [`wrap_quote`] at `depth`.
+fn quote_inset(depth: usize, rem: f32) -> f32 {
+    if depth == 0 {
+        0.0
+    } else {
+        2.0 + 0.75 * rem + QUOTE_INDENT * (depth as f32 - 1.0)
+    }
+}
+
 fn split_highlight(
     text: &str,
     char_offset: usize,
@@ -1266,6 +1438,7 @@ impl Render for Viewer {
         let mut row_for_line: Vec<usize> = Vec::with_capacity(self.lines.len());
         let mut diagram_block: Option<usize> = None;
         let mut diagram_row_ix = 0;
+        let tables = self.table_layouts(window);
         for (index, line) in self.lines.iter().enumerate() {
             if self.diagrams.contains_key(&line.block) {
                 if diagram_block == Some(line.block) {
@@ -1280,7 +1453,7 @@ impl Render for Viewer {
             } else {
                 diagram_block = None;
                 row_for_line.push(rows.len());
-                rows.push(self.render_line(index, line, cx));
+                rows.push(self.render_line(index, line, tables.get(&index).map(|w| &**w), cx));
             }
         }
         // Cursor-moving commands ask to keep the target row in view. Normal
@@ -1504,6 +1677,22 @@ mod tests {
                 ("c".to_string(), false),
             ]
         );
+    }
+
+    #[test]
+    fn table_columns_fit_content_then_shrink_toward_widest_word() {
+        assert_eq!(
+            distribute_columns(&[20.0, 30.0], &[40.0, 60.0], 500.0),
+            vec![40.0, 60.0]
+        );
+        assert_eq!(
+            distribute_columns(&[20.0, 30.0], &[40.0, 60.0], 10.0),
+            vec![20.0, 30.0]
+        );
+        let widths = distribute_columns(&[20.0, 100.0], &[40.0, 900.0], 400.0);
+        assert!(widths[0] >= 20.0 && widths[1] >= 100.0, "{widths:?}");
+        assert!(widths.iter().sum::<f32>() <= 400.0, "{widths:?}");
+        assert!(widths[1] - 100.0 > widths[0] - 20.0, "{widths:?}");
     }
 
     #[test]
