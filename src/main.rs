@@ -15,12 +15,14 @@ mod vim;
 mod watch;
 
 use gpui::{
-    canvas, div, point, prelude::*, px, rgb, size, AnyElement, App, Bounds, ClipboardItem, Context,
-    Font, FontFallbacks, FontWeight, Keystroke, PathBuilder, Pixels, ScrollHandle, SharedString,
-    StrikethroughStyle, StyledText, TextRun, UnderlineStyle, Window, WindowBounds, WindowOptions,
-    WindowTextSystem,
+    canvas, div, fill, point, prelude::*, px, rgb, size, AnyElement, App, Bounds, ClipboardItem,
+    Context, DispatchPhase, Font, FontFallbacks, FontWeight, HitboxBehavior, Keystroke,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, ScrollHandle,
+    SharedString, StrikethroughStyle, StyledText, TextRun, UnderlineStyle, Window, WindowBounds,
+    WindowOptions, WindowTextSystem,
 };
 use gpui_platform::application;
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
@@ -44,6 +46,8 @@ const DEFAULT_ZOOM_PX: f32 = 15.0;
 /// How long the "Copied to clipboard" confirmation stays visible next to a
 /// code block's Copy button after it is clicked.
 const COPIED_MESSAGE_DURATION: Duration = Duration::from_millis(1500);
+const SCROLLBAR_WIDTH: f32 = 10.0;
+const SCROLLBAR_MIN_THUMB: f32 = 24.0;
 const MIN_ZOOM_PX: f32 = 10.0;
 const MAX_ZOOM_PX: f32 = 24.0;
 
@@ -84,6 +88,9 @@ struct Viewer {
     /// When true, the next paint scrolls the cursor's row into view. Pixel
     /// `j`/`k` scrolling leaves this false so it does not fight the offset.
     follow_cursor: bool,
+    /// While the scrollbar thumb is dragged: the pointer's distance from the
+    /// thumb's top edge, so the thumb doesn't jump under the pointer.
+    scrollbar_drag: Rc<Cell<Option<f32>>>,
     zoom_px: f32,
     /// Block index whose Copy button was most recently clicked. While set, a
     /// transient "Copied to clipboard" confirmation renders next to that
@@ -315,6 +322,126 @@ impl Viewer {
             .enumerate()
             .any(|(index, line)| line.block == block && self.line_highlight(index).is_some())
     }
+}
+
+/// Thumb `(top, height)` within a track of height `track`, or `None` when
+/// the content fits the viewport and no scrollbar is needed.
+fn scrollbar_thumb(viewport: f32, max_offset: f32, offset: f32, track: f32) -> Option<(f32, f32)> {
+    if max_offset < 1.0 || viewport <= 0.0 || track <= 0.0 {
+        return None;
+    }
+    let height =
+        (track * viewport / (viewport + max_offset)).clamp(SCROLLBAR_MIN_THUMB.min(track), track);
+    let progress = (-offset / max_offset).clamp(0.0, 1.0);
+    Some(((track - height) * progress, height))
+}
+
+/// Scroll offset that puts the thumb's top edge at `thumb_top`.
+fn offset_for_thumb(thumb_top: f32, thumb_height: f32, track: f32, max_offset: f32) -> f32 {
+    let travel = track - thumb_height;
+    if travel <= 0.0 {
+        return 0.0;
+    }
+    -(thumb_top / travel).clamp(0.0, 1.0) * max_offset
+}
+
+/// Vertical scrollbar overlaying the right edge of the document body: drag
+/// the thumb, or click the track to jump there. Geometry is read during
+/// prepaint, after the body (an earlier sibling) has been laid out, so it
+/// tracks wheel, key, and resize changes in the same frame.
+fn scrollbar(scroll: ScrollHandle, drag: Rc<Cell<Option<f32>>>) -> impl IntoElement {
+    let measure = scroll.clone();
+    canvas(
+        move |bounds, window, _| {
+            let thumb = scrollbar_thumb(
+                measure.bounds().size.height.into(),
+                measure.max_offset().y.into(),
+                measure.offset().y.into(),
+                bounds.size.height.into(),
+            )?;
+            // Wheel events still reach the body underneath; clicks stop here.
+            let hitbox = window.insert_hitbox(bounds, HitboxBehavior::BlockMouseExceptScroll);
+            Some((hitbox, thumb))
+        },
+        move |bounds, state, window, _| {
+            let Some((hitbox, (thumb_top, thumb_height))) = state else {
+                return;
+            };
+            let color = if drag.get().is_some() {
+                theme::SCROLLBAR_ACTIVE
+            } else if hitbox.is_hovered(window) {
+                theme::SCROLLBAR_HOVER
+            } else {
+                theme::SCROLLBAR_THUMB
+            };
+            let thumb_bounds = Bounds::new(
+                point(bounds.left() + px(2.0), bounds.top() + px(thumb_top)),
+                size(bounds.size.width - px(4.0), px(thumb_height)),
+            );
+            window.paint_quad(fill(thumb_bounds, rgb(color)).corner_radii(px(3.0)));
+
+            let track: f32 = bounds.size.height.into();
+            let track_top = bounds.top();
+            let max_offset: f32 = scroll.max_offset().y.into();
+            let scroll_to = {
+                let scroll = scroll.clone();
+                move |thumb_top: f32| {
+                    let y = offset_for_thumb(thumb_top, thumb_height, track, max_offset);
+                    scroll.set_offset(point(scroll.offset().x, px(y)));
+                }
+            };
+
+            window.on_mouse_event({
+                let drag = drag.clone();
+                let scroll_to = scroll_to.clone();
+                move |event: &MouseDownEvent, phase, window, cx| {
+                    if phase != DispatchPhase::Bubble
+                        || event.button != MouseButton::Left
+                        || !hitbox.is_hovered(window)
+                    {
+                        return;
+                    }
+                    let y = f32::from(event.position.y - track_top);
+                    let grab = if (thumb_top..=thumb_top + thumb_height).contains(&y) {
+                        y - thumb_top
+                    } else {
+                        thumb_height / 2.0
+                    };
+                    drag.set(Some(grab));
+                    scroll_to(y - grab);
+                    cx.stop_propagation();
+                    window.refresh();
+                }
+            });
+            window.on_mouse_event({
+                let drag = drag.clone();
+                move |event: &MouseMoveEvent, phase, window, _| {
+                    let Some(grab) = drag.get() else {
+                        return;
+                    };
+                    if phase != DispatchPhase::Bubble {
+                        return;
+                    }
+                    if event.pressed_button != Some(MouseButton::Left) {
+                        drag.set(None);
+                    } else {
+                        scroll_to(f32::from(event.position.y - track_top) - grab);
+                    }
+                    window.refresh();
+                }
+            });
+            window.on_mouse_event(move |_: &MouseUpEvent, phase, window, _| {
+                if phase == DispatchPhase::Bubble && drag.take().is_some() {
+                    window.refresh();
+                }
+            });
+        },
+    )
+    .absolute()
+    .top_0()
+    .right_0()
+    .bottom_0()
+    .w(px(SCROLLBAR_WIDTH))
 }
 
 fn needs_reload(previous: &str, current: &str, missing: bool) -> bool {
@@ -1508,7 +1635,16 @@ impl Render for Viewer {
                     }),
             )
             .children(self.render_front_matter())
-            .child(doc_body)
+            .child(
+                div()
+                    .relative()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .child(doc_body)
+                    .child(scrollbar(self.scroll.clone(), self.scrollbar_drag.clone())),
+            )
             .child(
                 div()
                     .px_4()
@@ -1561,6 +1697,7 @@ fn main() {
             _watch: watcher,
             scroll: ScrollHandle::new(),
             follow_cursor: false,
+            scrollbar_drag: Rc::default(),
             zoom_px: DEFAULT_ZOOM_PX,
             copied_block: None,
             copy_generation: 0,
@@ -1693,6 +1830,30 @@ mod tests {
                 ("c".to_string(), false),
             ]
         );
+    }
+
+    #[test]
+    fn scrollbar_hidden_when_content_fits() {
+        assert_eq!(scrollbar_thumb(500.0, 0.0, 0.0, 500.0), None);
+        assert_eq!(scrollbar_thumb(0.0, 300.0, 0.0, 500.0), None);
+    }
+
+    #[test]
+    fn scrollbar_thumb_tracks_offset_and_round_trips() {
+        let (top, height) = scrollbar_thumb(500.0, 500.0, 0.0, 500.0).unwrap();
+        assert_eq!((top, height), (0.0, 250.0));
+        let (top, _) = scrollbar_thumb(500.0, 500.0, -500.0, 500.0).unwrap();
+        assert_eq!(top, 250.0);
+        let (top, height) = scrollbar_thumb(500.0, 500.0, -200.0, 500.0).unwrap();
+        assert!((offset_for_thumb(top, height, 500.0, 500.0) + 200.0).abs() < 0.01);
+        assert_eq!(offset_for_thumb(-50.0, height, 500.0, 500.0), 0.0);
+        assert_eq!(offset_for_thumb(9999.0, height, 500.0, 500.0), -500.0);
+    }
+
+    #[test]
+    fn long_documents_keep_a_grabbable_thumb() {
+        let (_, height) = scrollbar_thumb(500.0, 100_000.0, 0.0, 500.0).unwrap();
+        assert_eq!(height, SCROLLBAR_MIN_THUMB);
     }
 
     #[test]

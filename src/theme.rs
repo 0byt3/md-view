@@ -61,6 +61,10 @@ pub const MARK_FG: u32 = 0x24292F;
 /// Native diagram node fill (`#1F2020`) and edges (`#CCCCCC` sampled).
 pub const DIAGRAM_FILL: u32 = 0x1F2020;
 pub const DIAGRAM_LINE: u32 = 0xCCCCCC;
+/// Scrollbar thumb at rest, under the pointer, and while dragged.
+pub const SCROLLBAR_THUMB: u32 = 0x3B424B;
+pub const SCROLLBAR_HOVER: u32 = 0x545D68;
+pub const SCROLLBAR_ACTIVE: u32 = 0x6E7681;
 
 #[cfg(test)]
 mod tests {
@@ -99,6 +103,9 @@ mod tests {
         assert!(luminance(LINK) > luminance(PAGE_BG));
         assert!(luminance(MARK_BG) > luminance(MARK_FG));
         assert!(luminance(DIAGRAM_LINE) > luminance(DIAGRAM_FILL));
+        assert!(luminance(SCROLLBAR_THUMB) > luminance(PAGE_BG));
+        assert!(luminance(SCROLLBAR_HOVER) > luminance(SCROLLBAR_THUMB));
+        assert!(luminance(SCROLLBAR_ACTIVE) > luminance(SCROLLBAR_HOVER));
     }
 
     #[test]
@@ -117,6 +124,9 @@ mod tests {
             MARK_FG,
             DIAGRAM_FILL,
             DIAGRAM_LINE,
+            SCROLLBAR_THUMB,
+            SCROLLBAR_HOVER,
+            SCROLLBAR_ACTIVE,
         ];
         for (i, a) in entries.iter().enumerate() {
             for b in &entries[i + 1..] {
