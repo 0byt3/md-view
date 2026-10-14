@@ -67,6 +67,9 @@ type ArrowHead = [(f32, f32); 3];
 struct Viewer {
     path_display: SharedString,
     path: PathBuf,
+    /// Raw text behind `doc`, so events that leave the content unchanged
+    /// (a `touch`, an editor saving identical bytes) skip the reload.
+    source: String,
     doc: markdown::Document,
     lines: Vec<vim::Line>,
     code: std::collections::HashMap<usize, Vec<Vec<highlight::Token>>>,
@@ -185,17 +188,24 @@ impl Viewer {
         while let Ok(event) = self.rx.try_recv() {
             match event {
                 watch::WatchEvent::Modified => {
+                    let source = markdown::load_file(&self.path);
+                    if !needs_reload(&self.source, &source, self.missing) {
+                        continue;
+                    }
                     let old_key = self
                         .lines
                         .get(self.vim.cursor.line)
                         .map(|line| line.key.clone());
-                    self.doc = markdown::parse_markdown(&markdown::load_file(&self.path));
+                    self.doc = markdown::parse_markdown(&source);
+                    self.source = source;
                     self.lines = vim::build_lines(&self.doc);
                     self.code = highlight::highlight_document(&self.doc);
                     self.diagrams = diagram_cache(&self.doc);
                     self.vim.rebase(old_key, &self.lines);
                     self.missing = false;
-                    self.follow_cursor = true;
+                    // The scroll offset is left alone: normal-mode scrolling
+                    // never moves the cursor, so following it here would
+                    // jump back to wherever the cursor was last placed.
                     changed = true;
                 }
                 watch::WatchEvent::Gone => {
@@ -305,6 +315,10 @@ impl Viewer {
             .enumerate()
             .any(|(index, line)| line.block == block && self.line_highlight(index).is_some())
     }
+}
+
+fn needs_reload(previous: &str, current: &str, missing: bool) -> bool {
+    missing || previous != current
 }
 
 /// Parsed diagrams by block index. Mermaid blocks that fail to parse stay
@@ -1516,7 +1530,8 @@ fn main() {
     let display_path = absolute_display_path(&path, &current_directory);
     let path_label = path_display(&display_path, home.as_deref());
     let missing = !path.exists();
-    let doc = markdown::parse_markdown(&markdown::load_file(&path));
+    let source = markdown::load_file(&path);
+    let doc = markdown::parse_markdown(&source);
     let lines = vim::build_lines(&doc);
     let code = highlight::highlight_document(&doc);
     let diagrams = diagram_cache(&doc);
@@ -1535,6 +1550,7 @@ fn main() {
         let view = cx.new(|_| Viewer {
             path_display: path_label.into(),
             path,
+            source,
             doc,
             lines,
             code,
@@ -1677,6 +1693,13 @@ mod tests {
                 ("c".to_string(), false),
             ]
         );
+    }
+
+    #[test]
+    fn reload_only_when_content_changes_or_file_returns() {
+        assert!(!needs_reload("# a\n", "# a\n", false));
+        assert!(needs_reload("# a\n", "# b\n", false));
+        assert!(needs_reload("# a\n", "# a\n", true));
     }
 
     #[test]
